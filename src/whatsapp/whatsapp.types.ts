@@ -49,4 +49,5 @@ export interface WhatsappWebhookResult {
   messagesReceived: number;
   messagesProcessed: number;
   repliesSent: number;
+  errors: number;
 }

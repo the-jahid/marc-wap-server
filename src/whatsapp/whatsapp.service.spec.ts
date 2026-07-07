@@ -77,12 +77,14 @@ describe('WhatsappService', () => {
       messagesReceived: 1,
       messagesProcessed: 1,
       repliesSent: 1,
+      errors: 0,
     });
     await expect(service.processWebhook(payload)).resolves.toEqual({
       received: true,
       messagesReceived: 1,
       messagesProcessed: 0,
       repliesSent: 0,
+      errors: 0,
     });
 
     expect(createReply).toHaveBeenCalledTimes(1);
@@ -122,7 +124,54 @@ describe('WhatsappService', () => {
       messagesReceived: 0,
       messagesProcessed: 0,
       repliesSent: 0,
+      errors: 0,
     });
     expect(sendWhatsAppText).not.toHaveBeenCalled();
+  });
+
+  it('acknowledges message webhooks when sending the reply fails', async () => {
+    const service = new WhatsappService(configService);
+    const serviceInternals = service as unknown as {
+      createReply: () => Promise<string>;
+      sendWhatsAppText: (
+        to: string,
+        body: string,
+        phoneNumberIdFromWebhook?: string,
+      ) => Promise<void>;
+    };
+    jest.spyOn(serviceInternals, 'createReply').mockResolvedValue('Hello');
+    jest
+      .spyOn(serviceInternals, 'sendWhatsAppText')
+      .mockRejectedValue(new Error('send failed'));
+    const payload: WhatsappWebhookPayload = {
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                messages: [
+                  {
+                    from: '15551234567',
+                    id: 'wamid.send-failed',
+                    type: 'text',
+                    text: {
+                      body: 'Hi',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    await expect(service.processWebhook(payload)).resolves.toEqual({
+      received: true,
+      messagesReceived: 1,
+      messagesProcessed: 0,
+      repliesSent: 0,
+      errors: 1,
+    });
   });
 });

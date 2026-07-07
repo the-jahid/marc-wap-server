@@ -3,6 +3,7 @@ import {
   Controller,
   ForbiddenException,
   Get,
+  HttpCode,
   Post,
   Query,
 } from '@nestjs/common';
@@ -32,6 +33,7 @@ export class WhatsappController {
   }
 
   @Post()
+  @HttpCode(200)
   async receiveWebhook(
     @Body() payload: WhatsappWebhookPayload,
   ): Promise<WhatsappWebhookResult> {

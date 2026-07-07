@@ -47,6 +47,7 @@ export class WhatsappService {
     const envelopes = this.extractMessageEnvelopes(payload);
     let messagesProcessed = 0;
     let repliesSent = 0;
+    let errors = 0;
 
     for (const envelope of envelopes) {
       const { message } = envelope;
@@ -77,11 +78,12 @@ export class WhatsappService {
         messagesProcessed += 1;
         repliesSent += 1;
       } catch (error) {
+        errors += 1;
+        this.rememberProcessedMessage(message.id);
         this.logger.error(
           `Failed to process WhatsApp message ${message.id}`,
           error instanceof Error ? error.stack : String(error),
         );
-        throw error;
       } finally {
         this.processingMessageIds.delete(message.id);
       }
@@ -92,6 +94,7 @@ export class WhatsappService {
       messagesReceived: envelopes.length,
       messagesProcessed,
       repliesSent,
+      errors,
     };
   }
 
