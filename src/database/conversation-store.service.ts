@@ -1,11 +1,6 @@
-import {
-  Injectable,
-  Logger,
-  OnModuleDestroy,
-  OnModuleInit,
-} from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Pool } from 'pg';
+import { PgPoolService } from './pg-pool.service';
 
 export type ConversationRole = 'USER' | 'ASSISTANT';
 
@@ -13,6 +8,18 @@ export type ConversationMessageRecord = {
   id: number;
   role: ConversationRole;
   content: string;
+};
+
+export type ConversationMessageWithTimestamp = ConversationMessageRecord & {
+  createdAt: string;
+};
+
+export type ConversationSummary = {
+  phoneNumber: string;
+  lastMessage: string;
+  lastRole: ConversationRole;
+  lastActivityAt: string;
+  messageCount: number;
 };
 
 export type ConversationStore = {
@@ -30,32 +37,17 @@ export type ConversationStore = {
 
 @Injectable()
 export class ConversationStoreService
-  implements ConversationStore, OnModuleInit, OnModuleDestroy
+  implements ConversationStore, OnModuleInit
 {
   private readonly logger = new Logger(ConversationStoreService.name);
   private readonly pool: Pool;
 
-  constructor(configService: ConfigService) {
-    const databaseUrl = configService.get<string>('DATABASE_URL')?.trim();
-
-    if (!databaseUrl) {
-      throw new Error('DATABASE_URL environment variable is required');
-    }
-
-    this.pool = new Pool({
-      connectionString: databaseUrl,
-      ssl: databaseUrl.includes('sslmode=require')
-        ? { rejectUnauthorized: false }
-        : undefined,
-    });
+  constructor(poolService: PgPoolService) {
+    this.pool = poolService.pool;
   }
 
   async onModuleInit(): Promise<void> {
     await this.ensureSchema();
-  }
-
-  async onModuleDestroy(): Promise<void> {
-    await this.pool.end();
   }
 
   async findLatestMessages(
@@ -74,6 +66,43 @@ export class ConversationStoreService
     );
 
     return result.rows.reverse();
+  }
+
+  async listConversations(): Promise<ConversationSummary[]> {
+    const result = await this.pool.query<ConversationSummary>(
+      `
+        SELECT DISTINCT ON ("phoneNumber")
+          "phoneNumber",
+          content AS "lastMessage",
+          role AS "lastRole",
+          "createdAt" AS "lastActivityAt",
+          COUNT(*) OVER (PARTITION BY "phoneNumber")::int AS "messageCount"
+        FROM "ConversationMessage"
+        ORDER BY "phoneNumber", id DESC
+      `,
+    );
+
+    return result.rows.sort(
+      (a, b) =>
+        new Date(b.lastActivityAt).getTime() -
+        new Date(a.lastActivityAt).getTime(),
+    );
+  }
+
+  async findAllMessages(
+    phoneNumber: string,
+  ): Promise<ConversationMessageWithTimestamp[]> {
+    const result = await this.pool.query<ConversationMessageWithTimestamp>(
+      `
+        SELECT id, role, content, "createdAt"
+        FROM "ConversationMessage"
+        WHERE "phoneNumber" = $1
+        ORDER BY id ASC
+      `,
+      [phoneNumber],
+    );
+
+    return result.rows;
   }
 
   async saveTurn(

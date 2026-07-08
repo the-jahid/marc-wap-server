@@ -19,11 +19,18 @@ import type {
   WhatsappWebhookPayload,
   WhatsappWebhookResult,
 } from './whatsapp.types';
+import {
+  AgentConfigService,
+  DEFAULT_MODEL,
+  DEFAULT_SYSTEM_PROMPT,
+} from '../agent-config/agent-config.service';
 import { CONVERSATION_STORE } from '../database/conversation-store.constants';
 import type { ConversationStore } from '../database/conversation-store.service';
+import { KnowledgebaseService } from '../knowledgebase/knowledgebase.service';
 
 const MAX_CONVERSATION_TURNS = 15;
 const MAX_CONVERSATION_MESSAGES = MAX_CONVERSATION_TURNS * 2;
+const MAX_KNOWLEDGEBASE_CONTEXT_CHARS = 24_000;
 const CONVERSATION_ROLE = {
   USER: 'USER',
   ASSISTANT: 'ASSISTANT',
@@ -43,12 +50,17 @@ export class WhatsappService {
   private readonly processedMessageOrder: string[] = [];
   private readonly processingMessageIds = new Set<string>();
   private chatModel?: ChatOpenAI;
+  private chatModelName?: string;
 
   constructor(
     private readonly configService: ConfigService,
     @Optional()
     @Inject(CONVERSATION_STORE)
     private readonly conversationStore?: ConversationStore,
+    @Optional()
+    private readonly agentConfigService?: AgentConfigService,
+    @Optional()
+    private readonly knowledgebaseService?: KnowledgebaseService,
   ) {}
 
   isValidWebhookChallenge(mode?: string, verifyToken?: string): boolean {
@@ -127,11 +139,13 @@ export class WhatsappService {
       return 'Please send a text message. I can only respond to text right now.';
     }
 
-    const chatModel = this.getChatModel();
+    const { systemPrompt, model } = await this.resolveAgentSettings();
+    const chatModel = this.getChatModel(model);
     const userId = message.from ?? '';
     const history = await this.getConversationHistory(userId);
+    const knowledgebaseContext = await this.buildKnowledgebaseContext();
     const messages = [
-      new SystemMessage(this.getSystemPrompt()),
+      new SystemMessage(`${systemPrompt}${knowledgebaseContext}`),
       ...history,
       new HumanMessage(text),
     ];
@@ -146,33 +160,83 @@ export class WhatsappService {
     return finalReply;
   }
 
-  private getChatModel(): ChatOpenAI {
-    if (this.chatModel) {
+  private getChatModel(model: string): ChatOpenAI {
+    if (this.chatModel && this.chatModelName === model) {
       return this.chatModel;
     }
 
     const apiKey = this.getRequiredConfig(['OPENAI_API_KEY']);
-    const model =
-      this.configService.get<string>('OPENAI_MODEL')?.trim() || 'gpt-5.5';
 
     this.chatModel = new ChatOpenAI({
       apiKey,
       model,
       maxRetries: 2,
     });
+    this.chatModelName = model;
 
     return this.chatModel;
   }
 
-  private getSystemPrompt(): string {
-    return (
-      this.configService.get<string>('CHATBOT_SYSTEM_PROMPT')?.trim() ||
-      [
-        'You are a helpful WhatsApp assistant.',
-        'Keep replies concise, clear, and suitable for mobile chat.',
-        'Ask a short follow-up question when you need more details.',
-      ].join(' ')
-    );
+  private async resolveAgentSettings(): Promise<{
+    systemPrompt: string;
+    model: string;
+  }> {
+    let storedSystemPrompt: string | undefined;
+    let storedModel: string | undefined;
+
+    if (this.agentConfigService) {
+      try {
+        const stored = await this.agentConfigService.getConfig();
+        storedSystemPrompt = stored.systemPrompt?.trim() || undefined;
+        storedModel = stored.model?.trim() || undefined;
+      } catch (error) {
+        this.logger.warn(
+          'Failed to load stored agent config; falling back to environment',
+          error instanceof Error ? error.stack : String(error),
+        );
+      }
+    }
+
+    return {
+      systemPrompt:
+        storedSystemPrompt ||
+        this.configService.get<string>('CHATBOT_SYSTEM_PROMPT')?.trim() ||
+        DEFAULT_SYSTEM_PROMPT,
+      model:
+        storedModel ||
+        this.configService.get<string>('OPENAI_MODEL')?.trim() ||
+        DEFAULT_MODEL,
+    };
+  }
+
+  private async buildKnowledgebaseContext(): Promise<string> {
+    if (!this.knowledgebaseService) {
+      return '';
+    }
+
+    try {
+      const entries = await this.knowledgebaseService.list();
+
+      if (entries.length === 0) {
+        return '';
+      }
+
+      const sections = entries
+        .map((entry) => `### ${entry.title}\n${entry.content}`)
+        .join('\n\n');
+
+      return `\n\nUse the following knowledge base to answer questions when relevant:\n\n${sections}`.slice(
+        0,
+        MAX_KNOWLEDGEBASE_CONTEXT_CHARS,
+      );
+    } catch (error) {
+      this.logger.warn(
+        'Failed to load knowledgebase; replying without it',
+        error instanceof Error ? error.stack : String(error),
+      );
+
+      return '';
+    }
   }
 
   private async sendWhatsAppText(
