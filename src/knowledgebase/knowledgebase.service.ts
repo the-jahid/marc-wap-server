@@ -1,8 +1,9 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Pool } from 'pg';
 import { PgPoolService } from '../database/pg-pool.service';
-import { DocumentTextService } from './document-text.service';
-import {
+import type { DocumentTextService } from './document-text.service';
+import type {
   KnowledgeVectorMatch,
   KnowledgebaseVectorService,
 } from './knowledgebase-vector.service';
@@ -26,6 +27,11 @@ export type KnowledgeEntry = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type KnowledgeVectorState = Pick<
+  KnowledgeEntry,
+  'chunkCount' | 'vectorStatus' | 'vectorError'
+>;
 
 type KnowledgeEntryRow = KnowledgeEntry & {
   sourceType: 'text' | 'document';
@@ -56,11 +62,12 @@ const KNOWLEDGE_ENTRY_SELECT = `
 export class KnowledgebaseService implements OnModuleInit {
   private readonly logger = new Logger(KnowledgebaseService.name);
   private readonly pool: Pool;
+  private documentTextService: DocumentTextService | null = null;
+  private vectorService: KnowledgebaseVectorService | null = null;
 
   constructor(
     poolService: PgPoolService,
-    private readonly documentTextService: DocumentTextService,
-    private readonly vectorService: KnowledgebaseVectorService,
+    private readonly configService: ConfigService,
   ) {
     this.pool = poolService.pool;
   }
@@ -130,7 +137,8 @@ export class KnowledgebaseService implements OnModuleInit {
     file: UploadedKnowledgeFile,
     title?: string,
   ): Promise<KnowledgeEntry> {
-    const content = await this.documentTextService.extractText(file);
+    const documentTextService = await this.getDocumentTextService();
+    const content = await documentTextService.extractText(file);
     const entryTitle = title?.trim() || file.originalname;
     const result = await this.pool.query<KnowledgeEntry>(
       `
@@ -195,8 +203,14 @@ export class KnowledgebaseService implements OnModuleInit {
       return false;
     }
 
+    if (!this.isVectorSearchConfigured()) {
+      return true;
+    }
+
     try {
-      await this.vectorService.deleteEntry(id);
+      const vectorService = await this.getVectorService();
+
+      await vectorService.deleteEntry(id);
     } catch (error) {
       this.logger.warn(
         `Deleted knowledge entry ${id}, but failed to delete Pinecone vectors`,
@@ -208,9 +222,10 @@ export class KnowledgebaseService implements OnModuleInit {
   }
 
   async buildContextForQuestion(question: string): Promise<string> {
-    if (this.vectorService.isConfigured()) {
+    if (this.isVectorSearchConfigured()) {
       try {
-        const matches = await this.vectorService.search(question);
+        const vectorService = await this.getVectorService();
+        const matches = await vectorService.search(question);
         const freshMatches = await this.filterFreshVectorMatches(matches);
 
         if (freshMatches.length > 0) {
@@ -227,20 +242,41 @@ export class KnowledgebaseService implements OnModuleInit {
     return this.formatStoredContext(await this.list());
   }
 
-  private async syncVectors(entry: KnowledgeEntry): Promise<KnowledgeEntry> {
-    const result = await this.vectorService.upsertEntry(entry);
+  async setVectorState(
+    id: number,
+    state: KnowledgeVectorState,
+  ): Promise<KnowledgeEntry | null> {
+    return this.updateVectorState(id, state);
+  }
 
-    return this.updateVectorState(entry.id, {
-      chunkCount: result.chunkCount,
-      vectorStatus: result.status,
-      vectorError: result.error,
-    });
+  private async syncVectors(entry: KnowledgeEntry): Promise<KnowledgeEntry> {
+    if (!this.isVectorSearchConfigured()) {
+      return (
+        (await this.updateVectorState(entry.id, {
+          chunkCount: 0,
+          vectorStatus: 'not_configured',
+          vectorError:
+            'Set OPENAI_API_KEY, PINECONE_API_KEY, and PINECONE_INDEX_NAME or PINECONE_INDEX_HOST to enable vector search.',
+        })) ?? entry
+      );
+    }
+
+    const vectorService = await this.getVectorService();
+    const result = await vectorService.upsertEntry(entry);
+
+    return (
+      (await this.updateVectorState(entry.id, {
+        chunkCount: result.chunkCount,
+        vectorStatus: result.status,
+        vectorError: result.error,
+      })) ?? entry
+    );
   }
 
   private async updateVectorState(
     id: number,
-    state: Pick<KnowledgeEntry, 'chunkCount' | 'vectorStatus' | 'vectorError'>,
-  ): Promise<KnowledgeEntry> {
+    state: KnowledgeVectorState,
+  ): Promise<KnowledgeEntry | null> {
     const result = await this.pool.query<KnowledgeEntry>(
       `
         UPDATE "KnowledgeEntry"
@@ -259,7 +295,58 @@ export class KnowledgebaseService implements OnModuleInit {
       ],
     );
 
-    return result.rows[0];
+    return result.rows[0] ?? null;
+  }
+
+  private async getDocumentTextService(): Promise<DocumentTextService> {
+    let documentTextService = this.documentTextService;
+
+    if (!documentTextService) {
+      const { DocumentTextService } = await import(
+        './document-text.service.js'
+      );
+
+      documentTextService = new DocumentTextService();
+      this.documentTextService = documentTextService;
+    }
+
+    return documentTextService;
+  }
+
+  private async getVectorService(): Promise<KnowledgebaseVectorService> {
+    let vectorService = this.vectorService;
+
+    if (!vectorService) {
+      const { KnowledgebaseVectorService } = await import(
+        './knowledgebase-vector.service.js'
+      );
+
+      vectorService = new KnowledgebaseVectorService(this.configService);
+      this.vectorService = vectorService;
+    }
+
+    return vectorService;
+  }
+
+  private isVectorSearchConfigured(): boolean {
+    const openAiApiKey = this.configService
+      .get<string>('OPENAI_API_KEY')
+      ?.trim();
+    const pineconeApiKey = this.configService
+      .get<string>('PINECONE_API_KEY')
+      ?.trim();
+    const pineconeIndexName = this.configService
+      .get<string>('PINECONE_INDEX_NAME')
+      ?.trim();
+    const pineconeIndexHost = this.configService
+      .get<string>('PINECONE_INDEX_HOST')
+      ?.trim();
+
+    return Boolean(
+      openAiApiKey &&
+        pineconeApiKey &&
+        (pineconeIndexName || pineconeIndexHost),
+    );
   }
 
   private async filterFreshVectorMatches(
