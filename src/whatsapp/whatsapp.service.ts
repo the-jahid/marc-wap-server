@@ -158,7 +158,6 @@ export class WhatsappService {
     this.chatModel = new ChatOpenAI({
       apiKey,
       model,
-      temperature: 0.4,
       maxRetries: 2,
     });
 
