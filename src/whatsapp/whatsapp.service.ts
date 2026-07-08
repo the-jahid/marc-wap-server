@@ -1,7 +1,9 @@
 import {
+  Inject,
   Injectable,
   InternalServerErrorException,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ChatOpenAI } from '@langchain/openai';
@@ -17,6 +19,28 @@ import type {
   WhatsappWebhookPayload,
   WhatsappWebhookResult,
 } from './whatsapp.types';
+import { PRISMA_SERVICE } from '../prisma/prisma.constants';
+
+const MAX_CONVERSATION_TURNS = 15;
+const MAX_CONVERSATION_MESSAGES = MAX_CONVERSATION_TURNS * 2;
+const CONVERSATION_ROLE = {
+  USER: 'USER',
+  ASSISTANT: 'ASSISTANT',
+} as const;
+
+type StoredConversationMessage = {
+  id: number;
+  role: keyof typeof CONVERSATION_ROLE;
+  content: string;
+};
+
+type ConversationMessageStore = {
+  conversationMessage: {
+    findMany(args: unknown): Promise<StoredConversationMessage[]>;
+    createMany(args: unknown): Promise<unknown>;
+    deleteMany(args: unknown): Promise<unknown>;
+  };
+};
 
 @Injectable()
 export class WhatsappService {
@@ -27,7 +51,12 @@ export class WhatsappService {
   private readonly processingMessageIds = new Set<string>();
   private chatModel?: ChatOpenAI;
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    private readonly configService: ConfigService,
+    @Optional()
+    @Inject(PRISMA_SERVICE)
+    private readonly prismaService?: ConversationMessageStore,
+  ) {}
 
   isValidWebhookChallenge(mode?: string, verifyToken?: string): boolean {
     const expectedVerifyToken = this.configService
@@ -106,7 +135,8 @@ export class WhatsappService {
     }
 
     const chatModel = this.getChatModel();
-    const history = this.conversations.get(message.from ?? '') ?? [];
+    const userId = message.from ?? '';
+    const history = await this.getConversationHistory(userId);
     const messages = [
       new SystemMessage(this.getSystemPrompt()),
       ...history,
@@ -118,7 +148,7 @@ export class WhatsappService {
     const finalReply =
       reply || 'Sorry, I could not generate a reply. Please try again.';
 
-    this.saveConversationTurn(message.from ?? '', text, finalReply);
+    await this.saveConversationTurn(userId, text, finalReply);
 
     return finalReply;
   }
@@ -130,7 +160,7 @@ export class WhatsappService {
 
     const apiKey = this.getRequiredConfig(['OPENAI_API_KEY']);
     const model =
-      this.configService.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4o-mini';
+      this.configService.get<string>('OPENAI_MODEL')?.trim() || 'gpt-5.5';
 
     this.chatModel = new ChatOpenAI({
       apiKey,
@@ -223,18 +253,106 @@ export class WhatsappService {
     return envelopes;
   }
 
-  private saveConversationTurn(
+  private async getConversationHistory(userId: string): Promise<BaseMessage[]> {
+    if (!userId) {
+      return [];
+    }
+
+    if (!this.prismaService) {
+      return this.conversations.get(userId) ?? [];
+    }
+
+    try {
+      const history = await this.prismaService.conversationMessage.findMany({
+        where: { phoneNumber: userId },
+        orderBy: { id: 'desc' },
+        take: MAX_CONVERSATION_MESSAGES,
+      });
+
+      return history.reverse().map((message) => {
+        return message.role === CONVERSATION_ROLE.USER
+          ? new HumanMessage(message.content)
+          : new AIMessage(message.content);
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to load conversation history for ${userId}; using in-memory history`,
+        error instanceof Error ? error.stack : String(error),
+      );
+
+      return this.conversations.get(userId) ?? [];
+    }
+  }
+
+  private async saveConversationTurn(
     userId: string,
     userText: string,
     assistantText: string,
-  ): void {
+  ): Promise<void> {
     if (!userId) {
       return;
     }
 
+    this.saveConversationTurnInMemory(userId, userText, assistantText);
+
+    if (!this.prismaService) {
+      return;
+    }
+
+    try {
+      await this.prismaService.conversationMessage.createMany({
+        data: [
+          {
+            phoneNumber: userId,
+            role: CONVERSATION_ROLE.USER,
+            content: userText,
+          },
+          {
+            phoneNumber: userId,
+            role: CONVERSATION_ROLE.ASSISTANT,
+            content: assistantText,
+          },
+        ],
+      });
+
+      await this.trimStoredConversation(userId);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to save conversation history for ${userId}`,
+        error instanceof Error ? error.stack : String(error),
+      );
+    }
+  }
+
+  private saveConversationTurnInMemory(
+    userId: string,
+    userText: string,
+    assistantText: string,
+  ): void {
     const history = this.conversations.get(userId) ?? [];
     history.push(new HumanMessage(userText), new AIMessage(assistantText));
-    this.conversations.set(userId, history.slice(-10));
+    this.conversations.set(userId, history.slice(-MAX_CONVERSATION_MESSAGES));
+  }
+
+  private async trimStoredConversation(userId: string): Promise<void> {
+    if (!this.prismaService) {
+      return;
+    }
+
+    const oldMessages = await this.prismaService.conversationMessage.findMany({
+      where: { phoneNumber: userId },
+      orderBy: { id: 'desc' },
+      skip: MAX_CONVERSATION_MESSAGES,
+      select: { id: true },
+    });
+
+    if (oldMessages.length === 0) {
+      return;
+    }
+
+    await this.prismaService.conversationMessage.deleteMany({
+      where: { id: { in: oldMessages.map((message) => message.id) } },
+    });
   }
 
   private rememberProcessedMessage(messageId: string): void {

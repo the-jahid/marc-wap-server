@@ -1,0 +1,1 @@
+export const PRISMA_SERVICE = 'PRISMA_SERVICE';

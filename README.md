@@ -15,12 +15,13 @@ Fill `.env` with your real credentials.
 
 ```env
 OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
+OPENAI_MODEL=gpt-5.5
 WHATSAPP_API_KEY=
 WHATSAPP_PHONE_NUMBER_ID=
 WHATSAPP_VERIFY_TOKEN=
 WHATSAPP_GRAPH_API_VERSION=v23.0
 CHATBOT_SYSTEM_PROMPT=
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/marc?schema=public
 ```
 
 `WHATSAPP_API_KEY` is the Meta Graph API access token. `WHATSAPP_VERIFY_TOKEN` is any private string you choose and then enter in Meta's webhook setup.
@@ -36,6 +37,23 @@ Production:
 ```bash
 npm run build
 npm run start:prod
+```
+
+## Database
+
+Prisma is configured for PostgreSQL. After setting `DATABASE_URL`, generate the Prisma client and run migrations when models are added:
+
+```bash
+npm run prisma:generate
+npm run prisma:migrate
+```
+
+Conversation memory is stored in the `ConversationMessage` table, keyed by the WhatsApp sender phone number. The chatbot loads the latest 15 user/assistant turns for each sender before generating a reply.
+
+For external Render PostgreSQL connections, include SSL in the URL:
+
+```env
+DATABASE_URL=postgresql://user:password@host/database?sslmode=require
 ```
 
 ## WhatsApp Webhook
