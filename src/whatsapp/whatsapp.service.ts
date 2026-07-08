@@ -36,7 +36,6 @@ import { KnowledgebaseService } from '../knowledgebase/knowledgebase.service';
 
 const MAX_CONVERSATION_TURNS = 15;
 const MAX_CONVERSATION_MESSAGES = MAX_CONVERSATION_TURNS * 2;
-const MAX_KNOWLEDGEBASE_CONTEXT_CHARS = 24_000;
 const MAX_TRANSCRIPTION_AUDIO_BYTES = 25 * 1024 * 1024;
 const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-transcribe';
 const CONVERSATION_ROLE = {
@@ -165,7 +164,7 @@ export class WhatsappService {
     const chatModel = this.getChatModel(model);
     const userId = message.from ?? '';
     const history = await this.getConversationHistory(userId);
-    const knowledgebaseContext = await this.buildKnowledgebaseContext();
+    const knowledgebaseContext = await this.buildKnowledgebaseContext(text);
     const messages = [
       new SystemMessage(`${systemPrompt}${knowledgebaseContext}`),
       ...history,
@@ -259,26 +258,20 @@ export class WhatsappService {
     };
   }
 
-  private async buildKnowledgebaseContext(): Promise<string> {
+  private async buildKnowledgebaseContext(userText: string): Promise<string> {
     if (!this.knowledgebaseService) {
       return '';
     }
 
     try {
-      const entries = await this.knowledgebaseService.list();
+      const context =
+        await this.knowledgebaseService.buildContextForQuestion(userText);
 
-      if (entries.length === 0) {
+      if (!context) {
         return '';
       }
 
-      const sections = entries
-        .map((entry) => `### ${entry.title}\n${entry.content}`)
-        .join('\n\n');
-
-      return `\n\nUse the following knowledge base to answer questions when relevant:\n\n${sections}`.slice(
-        0,
-        MAX_KNOWLEDGEBASE_CONTEXT_CHARS,
-      );
+      return `\n\nUse the following knowledge base excerpts to answer questions when relevant:\n\n${context}`;
     } catch (error) {
       this.logger.warn(
         'Failed to load knowledgebase; replying without it',

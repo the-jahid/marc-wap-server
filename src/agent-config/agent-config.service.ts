@@ -10,6 +10,27 @@ export const DEFAULT_SYSTEM_PROMPT = [
 
 export const DEFAULT_MODEL = 'gpt-5.5';
 
+export const DEFAULT_CHAT_MODELS = [
+  DEFAULT_MODEL,
+  'gpt-5.5-pro',
+  'gpt-5.4',
+  'gpt-5.4-pro',
+  'gpt-5.4-mini',
+  'gpt-5.4-nano',
+  'gpt-5.2',
+  'gpt-5.2-pro',
+  'gpt-5.1',
+  'gpt-5',
+  'gpt-5-mini',
+  'gpt-5-nano',
+  'gpt-5-pro',
+  'o3',
+  'o3-pro',
+  'gpt-4.1',
+  'gpt-4.1-mini',
+  'gpt-4o-mini',
+];
+
 export type StoredAgentConfig = {
   systemPrompt: string | null;
   model: string | null;

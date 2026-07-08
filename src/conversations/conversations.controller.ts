@@ -7,9 +7,7 @@ import {
 
 @Controller('conversations')
 export class ConversationsController {
-  constructor(
-    private readonly conversationStore: ConversationStoreService,
-  ) {}
+  constructor(private readonly conversationStore: ConversationStoreService) {}
 
   @Get()
   listConversations(): Promise<ConversationSummary[]> {
@@ -20,8 +18,7 @@ export class ConversationsController {
   async findMessages(
     @Param('phoneNumber') phoneNumber: string,
   ): Promise<ConversationMessageWithTimestamp[]> {
-    const messages =
-      await this.conversationStore.findAllMessages(phoneNumber);
+    const messages = await this.conversationStore.findAllMessages(phoneNumber);
 
     if (messages.length === 0) {
       throw new NotFoundException(
