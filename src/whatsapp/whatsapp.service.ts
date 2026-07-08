@@ -19,7 +19,8 @@ import type {
   WhatsappWebhookPayload,
   WhatsappWebhookResult,
 } from './whatsapp.types';
-import { PRISMA_SERVICE } from '../prisma/prisma.constants';
+import { CONVERSATION_STORE } from '../database/conversation-store.constants';
+import type { ConversationStore } from '../database/conversation-store.service';
 
 const MAX_CONVERSATION_TURNS = 15;
 const MAX_CONVERSATION_MESSAGES = MAX_CONVERSATION_TURNS * 2;
@@ -34,14 +35,6 @@ type StoredConversationMessage = {
   content: string;
 };
 
-type ConversationMessageStore = {
-  conversationMessage: {
-    findMany(args: unknown): Promise<StoredConversationMessage[]>;
-    createMany(args: unknown): Promise<unknown>;
-    deleteMany(args: unknown): Promise<unknown>;
-  };
-};
-
 @Injectable()
 export class WhatsappService {
   private readonly logger = new Logger(WhatsappService.name);
@@ -54,8 +47,8 @@ export class WhatsappService {
   constructor(
     private readonly configService: ConfigService,
     @Optional()
-    @Inject(PRISMA_SERVICE)
-    private readonly prismaService?: ConversationMessageStore,
+    @Inject(CONVERSATION_STORE)
+    private readonly conversationStore?: ConversationStore,
   ) {}
 
   isValidWebhookChallenge(mode?: string, verifyToken?: string): boolean {
@@ -258,18 +251,17 @@ export class WhatsappService {
       return [];
     }
 
-    if (!this.prismaService) {
+    if (!this.conversationStore) {
       return this.conversations.get(userId) ?? [];
     }
 
     try {
-      const history = await this.prismaService.conversationMessage.findMany({
-        where: { phoneNumber: userId },
-        orderBy: { id: 'desc' },
-        take: MAX_CONVERSATION_MESSAGES,
-      });
+      const history = await this.conversationStore.findLatestMessages(
+        userId,
+        MAX_CONVERSATION_MESSAGES,
+      );
 
-      return history.reverse().map((message) => {
+      return history.map((message) => {
         return message.role === CONVERSATION_ROLE.USER
           ? new HumanMessage(message.content)
           : new AIMessage(message.content);
@@ -295,27 +287,17 @@ export class WhatsappService {
 
     this.saveConversationTurnInMemory(userId, userText, assistantText);
 
-    if (!this.prismaService) {
+    if (!this.conversationStore) {
       return;
     }
 
     try {
-      await this.prismaService.conversationMessage.createMany({
-        data: [
-          {
-            phoneNumber: userId,
-            role: CONVERSATION_ROLE.USER,
-            content: userText,
-          },
-          {
-            phoneNumber: userId,
-            role: CONVERSATION_ROLE.ASSISTANT,
-            content: assistantText,
-          },
-        ],
-      });
-
-      await this.trimStoredConversation(userId);
+      await this.conversationStore.saveTurn(
+        userId,
+        userText,
+        assistantText,
+        MAX_CONVERSATION_MESSAGES,
+      );
     } catch (error) {
       this.logger.warn(
         `Failed to save conversation history for ${userId}`,
@@ -332,27 +314,6 @@ export class WhatsappService {
     const history = this.conversations.get(userId) ?? [];
     history.push(new HumanMessage(userText), new AIMessage(assistantText));
     this.conversations.set(userId, history.slice(-MAX_CONVERSATION_MESSAGES));
-  }
-
-  private async trimStoredConversation(userId: string): Promise<void> {
-    if (!this.prismaService) {
-      return;
-    }
-
-    const oldMessages = await this.prismaService.conversationMessage.findMany({
-      where: { phoneNumber: userId },
-      orderBy: { id: 'desc' },
-      skip: MAX_CONVERSATION_MESSAGES,
-      select: { id: true },
-    });
-
-    if (oldMessages.length === 0) {
-      return;
-    }
-
-    await this.prismaService.conversationMessage.deleteMany({
-      where: { id: { in: oldMessages.map((message) => message.id) } },
-    });
   }
 
   private rememberProcessedMessage(messageId: string): void {

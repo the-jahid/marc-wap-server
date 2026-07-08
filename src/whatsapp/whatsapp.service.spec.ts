@@ -176,23 +176,19 @@ describe('WhatsappService', () => {
   });
 
   it('loads the latest 15 user and AI conversation turns by phone number', async () => {
-    const findMany = jest.fn().mockResolvedValue(
+    const findLatestMessages = jest.fn().mockResolvedValue(
       Array.from({ length: 30 }, (_, index) => {
-        const id = 30 - index;
+        const id = index + 1;
 
         return {
           id,
-          phoneNumber: '15551234567',
           role: id % 2 === 1 ? 'USER' : 'ASSISTANT',
           content: `message ${id}`,
-          createdAt: new Date(),
         };
       }),
     );
     const service = new WhatsappService(configService, {
-      conversationMessage: {
-        findMany,
-      },
+      findLatestMessages,
     } as never);
     const serviceInternals = service as unknown as {
       getConversationHistory: (userId: string) => Promise<
@@ -205,26 +201,16 @@ describe('WhatsappService', () => {
     const history =
       await serviceInternals.getConversationHistory('15551234567');
 
-    expect(findMany).toHaveBeenCalledWith({
-      where: { phoneNumber: '15551234567' },
-      orderBy: { id: 'desc' },
-      take: 30,
-    });
+    expect(findLatestMessages).toHaveBeenCalledWith('15551234567', 30);
     expect(history).toHaveLength(30);
     expect(history[0]?.content).toBe('message 1');
     expect(history[29]?.content).toBe('message 30');
   });
 
   it('saves user and AI replies and trims stored history to 15 turns', async () => {
-    const createMany = jest.fn().mockResolvedValue({ count: 2 });
-    const findMany = jest.fn().mockResolvedValue([{ id: 1 }, { id: 2 }]);
-    const deleteMany = jest.fn().mockResolvedValue({ count: 2 });
+    const saveTurn = jest.fn().mockResolvedValue(undefined);
     const service = new WhatsappService(configService, {
-      conversationMessage: {
-        createMany,
-        findMany,
-        deleteMany,
-      },
+      saveTurn,
     } as never);
     const serviceInternals = service as unknown as {
       saveConversationTurn: (
@@ -240,28 +226,11 @@ describe('WhatsappService', () => {
       'Hello from AI',
     );
 
-    expect(createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          phoneNumber: '15551234567',
-          role: 'USER',
-          content: 'Hi',
-        },
-        {
-          phoneNumber: '15551234567',
-          role: 'ASSISTANT',
-          content: 'Hello from AI',
-        },
-      ],
-    });
-    expect(findMany).toHaveBeenCalledWith({
-      where: { phoneNumber: '15551234567' },
-      orderBy: { id: 'desc' },
-      skip: 30,
-      select: { id: true },
-    });
-    expect(deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: [1, 2] } },
-    });
+    expect(saveTurn).toHaveBeenCalledWith(
+      '15551234567',
+      'Hi',
+      'Hello from AI',
+      30,
+    );
   });
 });

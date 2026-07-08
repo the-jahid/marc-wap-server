@@ -41,14 +41,9 @@ npm run start:prod
 
 ## Database
 
-Prisma is configured for PostgreSQL. After setting `DATABASE_URL`, generate the Prisma client and run migrations when models are added:
+PostgreSQL is used for conversation memory. On startup, the server creates the lightweight `ConversationMessage` table and index if they do not already exist.
 
-```bash
-npm run prisma:generate
-npm run prisma:migrate
-```
-
-Conversation memory is stored in the `ConversationMessage` table, keyed by the WhatsApp sender phone number. The chatbot loads the latest 15 user/assistant turns for each sender before generating a reply.
+Conversation memory is keyed by the WhatsApp sender phone number. The chatbot loads the latest 15 user/assistant turns for each sender before generating a reply.
 
 For external Render PostgreSQL connections, include SSL in the URL:
 
