@@ -7,6 +7,12 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ChatOpenAI } from '@langchain/openai';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import ffmpegPath from 'ffmpeg-static';
 import {
   AIMessage,
   HumanMessage,
@@ -31,15 +37,31 @@ import { KnowledgebaseService } from '../knowledgebase/knowledgebase.service';
 const MAX_CONVERSATION_TURNS = 15;
 const MAX_CONVERSATION_MESSAGES = MAX_CONVERSATION_TURNS * 2;
 const MAX_KNOWLEDGEBASE_CONTEXT_CHARS = 24_000;
+const MAX_TRANSCRIPTION_AUDIO_BYTES = 25 * 1024 * 1024;
+const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-transcribe';
 const CONVERSATION_ROLE = {
   USER: 'USER',
   ASSISTANT: 'ASSISTANT',
 } as const;
+const execFileAsync = promisify(execFile);
 
-type StoredConversationMessage = {
-  id: number;
-  role: keyof typeof CONVERSATION_ROLE;
-  content: string;
+type DownloadedWhatsappMedia = {
+  data: Buffer;
+  mimeType: string;
+};
+
+type TranscriptionAudio = DownloadedWhatsappMedia & {
+  filename: string;
+};
+
+type WhatsappMediaMetadata = {
+  url?: string;
+  mime_type?: string;
+  file_size?: number;
+};
+
+type OpenAITranscriptionResponse = {
+  text?: string;
 };
 
 @Injectable()
@@ -133,10 +155,10 @@ export class WhatsappService {
   }
 
   private async createReply(message: WhatsappInboundMessage): Promise<string> {
-    const text = message.text?.body?.trim();
+    const text = await this.extractUserText(message);
 
-    if (message.type !== 'text' || !text) {
-      return 'Please send a text message. I can only respond to text right now.';
+    if (!text) {
+      return 'Please send a text or voice message. I can respond to both now.';
     }
 
     const { systemPrompt, model } = await this.resolveAgentSettings();
@@ -158,6 +180,34 @@ export class WhatsappService {
     await this.saveConversationTurn(userId, text, finalReply);
 
     return finalReply;
+  }
+
+  private async extractUserText(
+    message: WhatsappInboundMessage,
+  ): Promise<string | null> {
+    const text = message.text?.body?.trim();
+
+    if (message.type === 'text' && text) {
+      return text;
+    }
+
+    if (message.type !== 'audio') {
+      return null;
+    }
+
+    const mediaId = message.audio?.id;
+
+    if (!mediaId) {
+      return null;
+    }
+
+    const media = await this.downloadWhatsappMedia(
+      mediaId,
+      message.audio?.mime_type,
+    );
+    const transcript = await this.transcribeAudio(media);
+
+    return transcript || null;
   }
 
   private getChatModel(model: string): ChatOpenAI {
@@ -288,6 +338,223 @@ export class WhatsappService {
         `WhatsApp API reply failed with HTTP ${response.status}: ${responseBody}`,
       );
     }
+  }
+
+  private async downloadWhatsappMedia(
+    mediaId: string,
+    webhookMimeType?: string,
+  ): Promise<DownloadedWhatsappMedia> {
+    const accessToken = this.getRequiredConfig([
+      'WHATSAPP_ACCESS_TOKEN',
+      'WHATSAPP_API_KEY',
+    ]);
+    const graphApiVersion =
+      this.configService.get<string>('WHATSAPP_GRAPH_API_VERSION')?.trim() ||
+      'v23.0';
+
+    const metadataResponse = await fetch(
+      `https://graph.facebook.com/${graphApiVersion}/${mediaId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      },
+    );
+
+    if (!metadataResponse.ok) {
+      const responseBody = await metadataResponse.text();
+      throw new InternalServerErrorException(
+        `WhatsApp media lookup failed with HTTP ${metadataResponse.status}: ${responseBody}`,
+      );
+    }
+
+    const metadata = (await metadataResponse.json()) as WhatsappMediaMetadata;
+
+    if (!metadata.url) {
+      throw new InternalServerErrorException(
+        'WhatsApp media lookup did not include a download URL',
+      );
+    }
+
+    if (
+      metadata.file_size &&
+      metadata.file_size > MAX_TRANSCRIPTION_AUDIO_BYTES
+    ) {
+      throw new InternalServerErrorException(
+        'WhatsApp voice message is too large to transcribe',
+      );
+    }
+
+    const mediaResponse = await fetch(metadata.url, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (!mediaResponse.ok) {
+      const responseBody = await mediaResponse.text();
+      throw new InternalServerErrorException(
+        `WhatsApp media download failed with HTTP ${mediaResponse.status}: ${responseBody}`,
+      );
+    }
+
+    const data = Buffer.from(await mediaResponse.arrayBuffer());
+
+    if (data.byteLength > MAX_TRANSCRIPTION_AUDIO_BYTES) {
+      throw new InternalServerErrorException(
+        'WhatsApp voice message is too large to transcribe',
+      );
+    }
+
+    return {
+      data,
+      mimeType:
+        mediaResponse.headers.get('content-type') ||
+        metadata.mime_type ||
+        webhookMimeType ||
+        'application/octet-stream',
+    };
+  }
+
+  private async transcribeAudio(
+    media: DownloadedWhatsappMedia,
+  ): Promise<string> {
+    const audio = await this.prepareAudioForTranscription(media);
+    const apiKey = this.getRequiredConfig(['OPENAI_API_KEY']);
+    const model =
+      this.configService.get<string>('OPENAI_TRANSCRIPTION_MODEL')?.trim() ||
+      DEFAULT_TRANSCRIPTION_MODEL;
+    const formData = new FormData();
+    formData.set('model', model);
+    formData.set(
+      'file',
+      new Blob([new Uint8Array(audio.data)], { type: audio.mimeType }),
+      audio.filename,
+    );
+
+    const response = await fetch(
+      'https://api.openai.com/v1/audio/transcriptions',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: formData,
+      },
+    );
+
+    if (!response.ok) {
+      const responseBody = await response.text();
+      throw new InternalServerErrorException(
+        `OpenAI transcription failed with HTTP ${response.status}: ${responseBody}`,
+      );
+    }
+
+    const payload = (await response.json()) as OpenAITranscriptionResponse;
+
+    return payload.text?.trim() ?? '';
+  }
+
+  private async prepareAudioForTranscription(
+    media: DownloadedWhatsappMedia,
+  ): Promise<TranscriptionAudio> {
+    const extension = this.getSupportedTranscriptionExtension(media.mimeType);
+
+    if (extension) {
+      return {
+        ...media,
+        filename: `voice.${extension}`,
+      };
+    }
+
+    return this.convertAudioToWav(media);
+  }
+
+  private async convertAudioToWav(
+    media: DownloadedWhatsappMedia,
+  ): Promise<TranscriptionAudio> {
+    if (!ffmpegPath) {
+      throw new InternalServerErrorException(
+        'FFmpeg is unavailable; cannot convert WhatsApp voice message audio',
+      );
+    }
+
+    const tempDirectory = await mkdtemp(join(tmpdir(), 'whatsapp-voice-'));
+    const inputPath = join(
+      tempDirectory,
+      `input.${this.getAudioExtension(media.mimeType)}`,
+    );
+    const outputPath = join(tempDirectory, 'voice.wav');
+
+    try {
+      await writeFile(inputPath, media.data);
+      await execFileAsync(ffmpegPath, [
+        '-y',
+        '-i',
+        inputPath,
+        '-ac',
+        '1',
+        '-ar',
+        '16000',
+        outputPath,
+      ]);
+
+      const data = await readFile(outputPath);
+
+      if (data.byteLength > MAX_TRANSCRIPTION_AUDIO_BYTES) {
+        throw new InternalServerErrorException(
+          'Converted WhatsApp voice message is too large to transcribe',
+        );
+      }
+
+      return {
+        data,
+        mimeType: 'audio/wav',
+        filename: 'voice.wav',
+      };
+    } finally {
+      await rm(tempDirectory, { force: true, recursive: true });
+    }
+  }
+
+  private getSupportedTranscriptionExtension(mimeType: string): string | null {
+    const normalizedMimeType = mimeType.toLowerCase();
+
+    if (normalizedMimeType.includes('mpeg')) {
+      return 'mp3';
+    }
+
+    if (normalizedMimeType.includes('mp4')) {
+      return 'mp4';
+    }
+
+    if (normalizedMimeType.includes('m4a')) {
+      return 'm4a';
+    }
+
+    if (normalizedMimeType.includes('wav')) {
+      return 'wav';
+    }
+
+    if (normalizedMimeType.includes('webm')) {
+      return 'webm';
+    }
+
+    return null;
+  }
+
+  private getAudioExtension(mimeType: string): string {
+    const normalizedMimeType = mimeType.toLowerCase();
+
+    if (normalizedMimeType.includes('ogg')) {
+      return 'ogg';
+    }
+
+    if (normalizedMimeType.includes('opus')) {
+      return 'opus';
+    }
+
+    return 'audio';
   }
 
   private extractMessageEnvelopes(

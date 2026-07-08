@@ -37,6 +37,12 @@ export interface WhatsappInboundMessage {
   text?: {
     body?: string;
   };
+  audio?: {
+    id?: string;
+    mime_type?: string;
+    sha256?: string;
+    voice?: boolean;
+  };
 }
 
 export interface WhatsappMessageEnvelope {

@@ -16,6 +16,7 @@ Fill `.env` with your real credentials.
 ```env
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.5
+OPENAI_TRANSCRIPTION_MODEL=gpt-4o-transcribe
 WHATSAPP_API_KEY=
 WHATSAPP_PHONE_NUMBER_ID=
 WHATSAPP_VERIFY_TOKEN=
@@ -24,7 +25,7 @@ CHATBOT_SYSTEM_PROMPT=
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/marc?schema=public
 ```
 
-`WHATSAPP_API_KEY` is the Meta Graph API access token. `WHATSAPP_VERIFY_TOKEN` is any private string you choose and then enter in Meta's webhook setup.
+`WHATSAPP_API_KEY` is the Meta Graph API access token. `WHATSAPP_VERIFY_TOKEN` is any private string you choose and then enter in Meta's webhook setup. Voice messages are downloaded from WhatsApp, converted to a supported audio format when needed, transcribed with `OPENAI_TRANSCRIPTION_MODEL`, and answered through the same agent flow as text messages.
 
 ## Run
 
