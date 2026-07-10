@@ -116,7 +116,12 @@ describe('WhatsappService', () => {
 
   it('processes incoming voice messages using the transcription as user text', async () => {
     const service = new WhatsappService(configService);
-    const invoke = jest.fn().mockResolvedValue({ content: 'Voice reply' });
+    const invoke = jest.fn().mockResolvedValue({
+      reply: 'Voice reply',
+      needsHumanAttention: false,
+      attentionReason: '',
+    });
+    const withStructuredOutput = jest.fn().mockReturnValue({ invoke });
     const serviceInternals = service as unknown as {
       createReply: (message: {
         from?: string;
@@ -136,11 +141,15 @@ describe('WhatsappService', () => {
         data: Buffer;
         mimeType: string;
       }) => Promise<string>;
-      getChatModel: () => { invoke: typeof invoke };
+      getChatModel: () => {
+        withStructuredOutput: typeof withStructuredOutput;
+      };
       saveConversationTurn: (
         userId: string,
         userText: string,
         assistantText: string,
+        needsHumanAttention?: boolean,
+        attentionReason?: string | null,
       ) => Promise<void>;
     };
     jest
@@ -149,7 +158,9 @@ describe('WhatsappService', () => {
     jest
       .spyOn(serviceInternals, 'transcribeAudio')
       .mockResolvedValue('What are your opening hours?');
-    jest.spyOn(serviceInternals, 'getChatModel').mockReturnValue({ invoke });
+    jest
+      .spyOn(serviceInternals, 'getChatModel')
+      .mockReturnValue({ withStructuredOutput });
     const saveConversationTurn = jest
       .spyOn(serviceInternals, 'saveConversationTurn')
       .mockResolvedValue(undefined);
@@ -180,6 +191,60 @@ describe('WhatsappService', () => {
       '15551234567',
       'What are your opening hours?',
       'Voice reply',
+      false,
+      null,
+    );
+  });
+
+  it('stores the advisor signal when a conversation needs human attention', async () => {
+    const service = new WhatsappService(configService);
+    const invoke = jest.fn().mockResolvedValue({
+      reply: 'I cannot access that account. A team member will review this.',
+      needsHumanAttention: true,
+      attentionReason: 'Account access is required.',
+    });
+    const serviceInternals = service as unknown as {
+      createReply: (message: {
+        from?: string;
+        id?: string;
+        type?: string;
+        text?: { body?: string };
+      }) => Promise<string>;
+      getChatModel: () => {
+        withStructuredOutput: () => { invoke: typeof invoke };
+      };
+      saveConversationTurn: (
+        userId: string,
+        userText: string,
+        assistantText: string,
+        needsHumanAttention?: boolean,
+        attentionReason?: string | null,
+      ) => Promise<void>;
+    };
+    jest.spyOn(serviceInternals, 'getChatModel').mockReturnValue({
+      withStructuredOutput: () => ({ invoke }),
+    });
+    const saveConversationTurn = jest
+      .spyOn(serviceInternals, 'saveConversationTurn')
+      .mockResolvedValue(undefined);
+
+    await expect(
+      serviceInternals.createReply({
+        from: '15551234567',
+        id: 'wamid.attention',
+        type: 'text',
+        text: { body: 'Can you change the billing owner on my account?' },
+      }),
+    ).resolves.toBe(
+      'I cannot access that account. A team member will review this.',
+    );
+
+    expect(saveConversationTurn).toHaveBeenCalledWith(
+      '15551234567',
+      'Can you change the billing owner on my account?',
+      'I cannot access that account. A team member will review this.',
+      true,
+      'Account access is required.',
     );
   });
 
@@ -380,6 +445,8 @@ describe('WhatsappService', () => {
       'Hi',
       'Hello from AI',
       30,
+      false,
+      null,
     );
   });
 });

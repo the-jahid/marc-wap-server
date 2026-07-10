@@ -12,6 +12,8 @@ export type ConversationMessageRecord = {
 
 export type ConversationMessageWithTimestamp = ConversationMessageRecord & {
   createdAt: string;
+  needsHumanAttention: boolean;
+  attentionReason: string | null;
 };
 
 export type ConversationSummary = {
@@ -20,6 +22,8 @@ export type ConversationSummary = {
   lastRole: ConversationRole;
   lastActivityAt: string;
   messageCount: number;
+  needsHumanAttention: boolean;
+  attentionReason: string | null;
 };
 
 export type ConversationStore = {
@@ -32,6 +36,8 @@ export type ConversationStore = {
     userText: string,
     assistantText: string,
     maxMessages: number,
+    needsHumanAttention?: boolean,
+    attentionReason?: string | null,
   ): Promise<void>;
 };
 
@@ -76,7 +82,9 @@ export class ConversationStoreService
           content AS "lastMessage",
           role AS "lastRole",
           "createdAt" AS "lastActivityAt",
-          COUNT(*) OVER (PARTITION BY "phoneNumber")::int AS "messageCount"
+          COUNT(*) OVER (PARTITION BY "phoneNumber")::int AS "messageCount",
+          "needsHumanAttention",
+          "attentionReason"
         FROM "ConversationMessage"
         ORDER BY "phoneNumber", id DESC
       `,
@@ -94,7 +102,13 @@ export class ConversationStoreService
   ): Promise<ConversationMessageWithTimestamp[]> {
     const result = await this.pool.query<ConversationMessageWithTimestamp>(
       `
-        SELECT id, role, content, "createdAt"
+        SELECT
+          id,
+          role,
+          content,
+          "createdAt",
+          "needsHumanAttention",
+          "attentionReason"
         FROM "ConversationMessage"
         WHERE "phoneNumber" = $1
         ORDER BY id ASC
@@ -114,7 +128,13 @@ export class ConversationStoreService
       `
         INSERT INTO "ConversationMessage" ("phoneNumber", role, content)
         VALUES ($1, $2, $3)
-        RETURNING id, role, content, "createdAt"
+        RETURNING
+          id,
+          role,
+          content,
+          "createdAt",
+          "needsHumanAttention",
+          "attentionReason"
       `,
       [phoneNumber, role, content],
     );
@@ -127,6 +147,8 @@ export class ConversationStoreService
     userText: string,
     assistantText: string,
     maxMessages: number,
+    needsHumanAttention = false,
+    attentionReason: string | null = null,
   ): Promise<void> {
     const client = await this.pool.connect();
 
@@ -134,10 +156,26 @@ export class ConversationStoreService
       await client.query('BEGIN');
       await client.query(
         `
-          INSERT INTO "ConversationMessage" ("phoneNumber", role, content)
-          VALUES ($1, $2, $3), ($1, $4, $5)
+          INSERT INTO "ConversationMessage" (
+            "phoneNumber",
+            role,
+            content,
+            "needsHumanAttention",
+            "attentionReason"
+          )
+          VALUES
+            ($1, $2, $3, FALSE, NULL),
+            ($1, $4, $5, $6, $7)
         `,
-        [phoneNumber, 'USER', userText, 'ASSISTANT', assistantText],
+        [
+          phoneNumber,
+          'USER',
+          userText,
+          'ASSISTANT',
+          assistantText,
+          needsHumanAttention,
+          needsHumanAttention ? attentionReason : null,
+        ],
       );
       await client.query(
         `
@@ -179,8 +217,15 @@ export class ConversationStoreService
         "phoneNumber" TEXT NOT NULL,
         role "ConversationRole" NOT NULL,
         content TEXT NOT NULL,
+        "needsHumanAttention" BOOLEAN NOT NULL DEFAULT FALSE,
+        "attentionReason" TEXT,
         "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+    await this.pool.query(`
+      ALTER TABLE "ConversationMessage"
+      ADD COLUMN IF NOT EXISTS "needsHumanAttention" BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS "attentionReason" TEXT;
     `);
     await this.pool.query(`
       CREATE INDEX IF NOT EXISTS "ConversationMessage_phoneNumber_id_idx"

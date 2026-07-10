@@ -63,6 +63,34 @@ type OpenAITranscriptionResponse = {
   text?: string;
 };
 
+type AdvisorReply = {
+  reply: string;
+  needsHumanAttention: boolean;
+  attentionReason: string;
+};
+
+const ADVISOR_REPLY_SCHEMA = {
+  type: 'object',
+  properties: {
+    reply: {
+      type: 'string',
+      description: 'The concise WhatsApp reply that will be sent to the user.',
+    },
+    needsHumanAttention: {
+      type: 'boolean',
+      description:
+        'True only when a person should review or take over: the user asks for a human, reports a serious complaint or urgent/high-risk issue, requests an action or private information the assistant cannot access, or the assistant cannot confidently resolve the request.',
+    },
+    attentionReason: {
+      type: 'string',
+      description:
+        'A short internal reason for the human advisor. Use an empty string when human attention is not needed.',
+    },
+  },
+  required: ['reply', 'needsHumanAttention', 'attentionReason'],
+  additionalProperties: false,
+} as const;
+
 @Injectable()
 export class WhatsappService {
   private readonly logger = new Logger(WhatsappService.name);
@@ -170,19 +198,99 @@ export class WhatsappService {
     const history = await this.getConversationHistory(userId);
     const knowledgebaseContext = await this.buildKnowledgebaseContext(text);
     const messages = [
-      new SystemMessage(`${systemPrompt}${knowledgebaseContext}`),
+      new SystemMessage(
+        `${systemPrompt}${knowledgebaseContext}\n\nAct as an advisor to the human team as well as the customer-facing assistant. Flag the conversation for human attention only when a person genuinely needs to review or take over.`,
+      ),
       ...history,
       new HumanMessage(text),
     ];
 
-    const response = await chatModel.invoke(messages);
-    const reply = this.contentToText(response.content).trim();
+    const advisorReply = await this.generateAdvisorReply(
+      chatModel,
+      messages,
+      text,
+    );
+    const reply = advisorReply.reply.trim();
     const finalReply =
       reply || 'Sorry, I could not generate a reply. Please try again.';
+    const needsHumanAttention =
+      advisorReply.needsHumanAttention || reply.length === 0;
+    const attentionReason = needsHumanAttention
+      ? (
+          advisorReply.attentionReason.trim() ||
+          'The AI advisor could not fully resolve this request.'
+        ).slice(0, 240)
+      : null;
 
-    await this.saveConversationTurn(userId, text, finalReply);
+    await this.saveConversationTurn(
+      userId,
+      text,
+      finalReply,
+      needsHumanAttention,
+      attentionReason,
+    );
 
     return finalReply;
+  }
+
+  private async generateAdvisorReply(
+    chatModel: ChatOpenAI,
+    messages: BaseMessage[],
+    userText: string,
+  ): Promise<AdvisorReply> {
+    try {
+      const structuredModel = chatModel.withStructuredOutput<AdvisorReply>(
+        ADVISOR_REPLY_SCHEMA,
+        {
+          name: 'whatsapp_advisor_reply',
+          method: 'jsonSchema',
+          strict: true,
+        },
+      );
+      const response = await structuredModel.invoke(messages);
+
+      return {
+        reply: response.reply ?? '',
+        needsHumanAttention: response.needsHumanAttention === true,
+        attentionReason: response.attentionReason ?? '',
+      };
+    } catch (error) {
+      this.logger.warn(
+        'Structured advisor response failed; using a plain reply',
+        error instanceof Error ? error.stack : String(error),
+      );
+
+      const response = await chatModel.invoke(messages);
+      const reply = this.contentToText(response.content).trim();
+      const fallbackSignal = this.inferHumanAttention(userText, reply);
+
+      return {
+        reply,
+        ...fallbackSignal,
+      };
+    }
+  }
+
+  private inferHumanAttention(
+    userText: string,
+    reply: string,
+  ): Pick<AdvisorReply, 'needsHumanAttention' | 'attentionReason'> {
+    const combinedText = `${userText}\n${reply}`.toLowerCase();
+    const escalationPatterns = [
+      /\b(human|person|representative|agent|manager|supervisor)\b/,
+      /\b(complaint|refund|fraud|scam|legal|emergency|urgent)\b/,
+      /\b(i (?:do not|don't) have|i cannot|i can't|unable to|not available)\b/,
+    ];
+    const needsHumanAttention = escalationPatterns.some((pattern) =>
+      pattern.test(combinedText),
+    );
+
+    return {
+      needsHumanAttention,
+      attentionReason: needsHumanAttention
+        ? 'The conversation may require information, action, or judgment from a human advisor.'
+        : '',
+    };
   }
 
   private async extractUserText(
@@ -607,6 +715,8 @@ export class WhatsappService {
     userId: string,
     userText: string,
     assistantText: string,
+    needsHumanAttention = false,
+    attentionReason: string | null = null,
   ): Promise<void> {
     if (!userId) {
       return;
@@ -624,6 +734,8 @@ export class WhatsappService {
         userText,
         assistantText,
         MAX_CONVERSATION_MESSAGES,
+        needsHumanAttention,
+        attentionReason,
       );
     } catch (error) {
       this.logger.warn(
