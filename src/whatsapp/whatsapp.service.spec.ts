@@ -30,6 +30,25 @@ describe('WhatsappService', () => {
     expect(service.isValidWebhookChallenge('ping', 'verify-token')).toBeFalsy();
   });
 
+  it('sends a manual text message through the WhatsApp sender', async () => {
+    const service = new WhatsappService(configService);
+    const serviceInternals = service as unknown as {
+      sendWhatsAppText: (to: string, body: string) => Promise<void>;
+    };
+    const sendWhatsAppText = jest
+      .spyOn(serviceInternals, 'sendWhatsAppText')
+      .mockResolvedValue(undefined);
+
+    await expect(
+      service.sendManualText('15551234567', 'Manual reply'),
+    ).resolves.toBeUndefined();
+
+    expect(sendWhatsAppText).toHaveBeenCalledWith(
+      '15551234567',
+      'Manual reply',
+    );
+  });
+
   it('processes incoming text messages and ignores duplicate webhook retries', async () => {
     const service = new WhatsappService(configService);
     const serviceInternals = service as unknown as {

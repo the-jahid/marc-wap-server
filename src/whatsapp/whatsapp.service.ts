@@ -96,6 +96,10 @@ export class WhatsappService {
     );
   }
 
+  async sendManualText(to: string, body: string): Promise<void> {
+    await this.sendWhatsAppText(to, body);
+  }
+
   async processWebhook(
     payload: WhatsappWebhookPayload,
   ): Promise<WhatsappWebhookResult> {

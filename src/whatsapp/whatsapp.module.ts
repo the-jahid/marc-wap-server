@@ -8,5 +8,6 @@ import { WhatsappService } from './whatsapp.service';
   imports: [AgentConfigModule, KnowledgebaseModule],
   controllers: [WhatsappController],
   providers: [WhatsappService],
+  exports: [WhatsappService],
 })
 export class WhatsappModule {}

@@ -105,6 +105,23 @@ export class ConversationStoreService
     return result.rows;
   }
 
+  async saveMessage(
+    phoneNumber: string,
+    role: ConversationRole,
+    content: string,
+  ): Promise<ConversationMessageWithTimestamp> {
+    const result = await this.pool.query<ConversationMessageWithTimestamp>(
+      `
+        INSERT INTO "ConversationMessage" ("phoneNumber", role, content)
+        VALUES ($1, $2, $3)
+        RETURNING id, role, content, "createdAt"
+      `,
+      [phoneNumber, role, content],
+    );
+
+    return result.rows[0];
+  }
+
   async saveTurn(
     phoneNumber: string,
     userText: string,
