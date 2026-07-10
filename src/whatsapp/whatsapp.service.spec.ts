@@ -196,6 +196,86 @@ describe('WhatsappService', () => {
     );
   });
 
+  it('calculates a supported FR/ES bra size without calling the chat model', async () => {
+    const service = new WhatsappService(configService);
+    const serviceInternals = service as unknown as {
+      createReply: (message: {
+        from?: string;
+        id?: string;
+        type?: string;
+        text?: { body?: string };
+      }) => Promise<string>;
+      getChatModel: () => unknown;
+      saveConversationTurn: (
+        userId: string,
+        userText: string,
+        assistantText: string,
+        needsHumanAttention?: boolean,
+        attentionReason?: string | null,
+      ) => Promise<void>;
+    };
+    const getChatModel = jest.spyOn(serviceInternals, 'getChatModel');
+    const saveConversationTurn = jest
+      .spyOn(serviceInternals, 'saveConversationTurn')
+      .mockResolvedValue(undefined);
+
+    const reply = await serviceInternals.createReply({
+      from: '15551234567',
+      id: 'wamid.bra-size',
+      type: 'text',
+      text: { body: '83 and 113' },
+    });
+
+    expect(reply).toContain('100 I (FR/ES)');
+    expect(reply).not.toContain(' EU');
+    expect(getChatModel).not.toHaveBeenCalled();
+    expect(saveConversationTurn).toHaveBeenCalledWith(
+      '15551234567',
+      '83 and 113',
+      reply,
+      false,
+      null,
+    );
+  });
+
+  it('flags unsupported bra measurements for a human advisor', async () => {
+    const service = new WhatsappService(configService);
+    const serviceInternals = service as unknown as {
+      createReply: (message: {
+        from?: string;
+        id?: string;
+        type?: string;
+        text?: { body?: string };
+      }) => Promise<string>;
+      saveConversationTurn: (
+        userId: string,
+        userText: string,
+        assistantText: string,
+        needsHumanAttention?: boolean,
+        attentionReason?: string | null,
+      ) => Promise<void>;
+    };
+    const saveConversationTurn = jest
+      .spyOn(serviceInternals, 'saveConversationTurn')
+      .mockResolvedValue(undefined);
+
+    const reply = await serviceInternals.createReply({
+      from: '15551234567',
+      id: 'wamid.bra-size-unsupported',
+      type: 'text',
+      text: { body: '83 and 118' },
+    });
+
+    expect(reply).toContain('cannot calculate an approximate size safely');
+    expect(saveConversationTurn).toHaveBeenCalledWith(
+      '15551234567',
+      '83 and 118',
+      reply,
+      true,
+      expect.stringContaining('outside the supported FR/ES sizing table'),
+    );
+  });
+
   it('stores the advisor signal when a conversation needs human attention', async () => {
     const service = new WhatsappService(configService);
     const invoke = jest.fn().mockResolvedValue({

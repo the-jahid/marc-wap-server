@@ -33,6 +33,7 @@ import {
 import { CONVERSATION_STORE } from '../database/conversation-store.constants';
 import type { ConversationStore } from '../database/conversation-store.service';
 import { KnowledgebaseService } from '../knowledgebase/knowledgebase.service';
+import { createBraSizeReply } from './bra-size-calculator';
 
 const MAX_CONVERSATION_TURNS = 15;
 const MAX_CONVERSATION_MESSAGES = MAX_CONVERSATION_TURNS * 2;
@@ -190,6 +191,20 @@ export class WhatsappService {
 
     if (!text) {
       return 'Please send a text or voice message. I can respond to both now.';
+    }
+
+    const braSizeReply = createBraSizeReply(text);
+
+    if (braSizeReply) {
+      await this.saveConversationTurn(
+        message.from ?? '',
+        text,
+        braSizeReply.reply,
+        braSizeReply.needsHumanAttention,
+        braSizeReply.attentionReason,
+      );
+
+      return braSizeReply.reply;
     }
 
     const { systemPrompt, model } = await this.resolveAgentSettings();
