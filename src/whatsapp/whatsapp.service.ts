@@ -17,6 +17,7 @@ import {
   AIMessage,
   HumanMessage,
   SystemMessage,
+  ToolMessage,
 } from '@langchain/core/messages';
 import type { BaseMessage, MessageContent } from '@langchain/core/messages';
 import type {
@@ -33,6 +34,8 @@ import {
 import { CONVERSATION_STORE } from '../database/conversation-store.constants';
 import type { ConversationStore } from '../database/conversation-store.service';
 import { KnowledgebaseService } from '../knowledgebase/knowledgebase.service';
+import { ShopifyService } from '../shopify/shopify.service';
+import type { CustomerOrder, ProductMatch } from '../shopify/shopify.types';
 import { createBraSizeReply } from './bra-size-calculator';
 
 const MAX_CONVERSATION_TURNS = 15;
@@ -92,6 +95,81 @@ const ADVISOR_REPLY_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+const ORDER_LOOKUP_TOOL_NAME = 'lookup_my_orders';
+
+/**
+ * Deliberately takes no parameters. The customer is identified by the phone
+ * number WhatsApp reported for the sender, which Meta has verified. If the
+ * model could pass an identifier instead, anyone could ask for "the order for
+ * +34..." and read a stranger's name, address and purchase history.
+ */
+const ORDER_LOOKUP_TOOL = {
+  type: 'function' as const,
+  function: {
+    name: ORDER_LOOKUP_TOOL_NAME,
+    description:
+      'Look up the orders belonging to the customer who is messaging right now. ' +
+      'Call this whenever they ask about an order, a delivery, shipping, tracking, a return or a refund. ' +
+      'It takes no arguments: the customer is identified automatically by their verified WhatsApp number. ' +
+      'Never ask the customer for an order number, email address or phone number in order to look up an order, ' +
+      'and never report an order that this tool did not return.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+};
+
+const ORDER_LOOKUP_SYSTEM_PROMPT =
+  `\n\nYou can look up this customer's own orders with the ${ORDER_LOOKUP_TOOL_NAME} tool. ` +
+  'They are identified by the WhatsApp number they are messaging from, so you never need to ask them who they are. ' +
+  'Only ever discuss orders that the tool returned; if it returns none, say you cannot find an order under their number ' +
+  'and hand the conversation to a human rather than guessing.';
+
+const PRODUCT_SEARCH_TOOL_NAME = 'search_products';
+
+const PRODUCT_SEARCH_TOOL = {
+  type: 'function' as const,
+  function: {
+    name: PRODUCT_SEARCH_TOOL_NAME,
+    description:
+      'Search the shop catalogue for products, prices and the sizes that are offered. ' +
+      'Call this whenever the customer asks whether a garment exists, what it costs, ' +
+      'or whether it comes in their size. Search with the product words the customer used ' +
+      '(in Spanish), for example "sujetador reductor" or "faja". ' +
+      'Results are keyword matches, not exact answers: read the titles and descriptions ' +
+      'and only tell the customer about products that genuinely match what they asked for.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description:
+            "Product keywords to search for, in the customer's own language.",
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * This shop does not keep real stock counts: every variant carries a placeholder
+ * quantity of roughly 10,000, so "available" means the size is offered for sale,
+ * never that a garment is confirmed to be on the shelf. Promising stock we cannot
+ * see would be a lie the shop has to absorb, so the model is told not to.
+ */
+const PRODUCT_SEARCH_SYSTEM_PROMPT =
+  `\n\nYou can search the shop catalogue with the ${PRODUCT_SEARCH_TOOL_NAME} tool. ` +
+  'Use it for any question about what the shop sells, what something costs, or which sizes exist. ' +
+  'The sizes it returns are the combinations the shop offers, and you may tell the customer a size ' +
+  'is available to order. You must NOT state stock quantities or promise that an item is physically ' +
+  'in the warehouse, because the shop does not track stock levels. Never invent a product, a price ' +
+  'or a size that the tool did not return; if the tool finds nothing that matches, say so plainly.';
+
 @Injectable()
 export class WhatsappService {
   private readonly logger = new Logger(WhatsappService.name);
@@ -111,6 +189,8 @@ export class WhatsappService {
     private readonly agentConfigService?: AgentConfigService,
     @Optional()
     private readonly knowledgebaseService?: KnowledgebaseService,
+    @Optional()
+    private readonly shopifyService?: ShopifyService,
   ) {}
 
   isValidWebhookChallenge(mode?: string, verifyToken?: string): boolean {
@@ -212,17 +292,26 @@ export class WhatsappService {
     const userId = message.from ?? '';
     const history = await this.getConversationHistory(userId);
     const knowledgebaseContext = await this.buildKnowledgebaseContext(text);
-    const messages = [
+    const shopifyPrompt = `${
+      this.canLookUpOrders(userId) ? ORDER_LOOKUP_SYSTEM_PROMPT : ''
+    }${this.canSearchProducts() ? PRODUCT_SEARCH_SYSTEM_PROMPT : ''}`;
+    const messages: BaseMessage[] = [
       new SystemMessage(
-        `${systemPrompt}${knowledgebaseContext}\n\nAct as an advisor to the human team as well as the customer-facing assistant. Flag the conversation for human attention only when a person genuinely needs to review or take over.`,
+        `${systemPrompt}${knowledgebaseContext}${shopifyPrompt}\n\nAct as an advisor to the human team as well as the customer-facing assistant. Flag the conversation for human attention only when a person genuinely needs to review or take over.`,
       ),
       ...history,
       new HumanMessage(text),
     ];
 
-    const advisorReply = await this.generateAdvisorReply(
+    const groundedMessages = await this.groundInShopify(
       chatModel,
       messages,
+      userId,
+    );
+
+    const advisorReply = await this.generateAdvisorReply(
+      chatModel,
+      groundedMessages,
       text,
     );
     const reply = advisorReply.reply.trim();
@@ -246,6 +335,176 @@ export class WhatsappService {
     );
 
     return finalReply;
+  }
+
+  private canLookUpOrders(customerPhone: string): boolean {
+    return (
+      Boolean(customerPhone) && this.shopifyService?.isConfigured() === true
+    );
+  }
+
+  private canSearchProducts(): boolean {
+    return this.shopifyService?.canSearchProducts() === true;
+  }
+
+  /**
+   * Lets the model pull real orders and real catalogue data before it answers,
+   * so the reply is grounded in Shopify rather than in whatever the model would
+   * otherwise invent about a price, a size or a delivery.
+   */
+  private async groundInShopify(
+    chatModel: ChatOpenAI,
+    messages: BaseMessage[],
+    customerPhone: string,
+  ): Promise<BaseMessage[]> {
+    const tools = [
+      ...(this.canLookUpOrders(customerPhone) ? [ORDER_LOOKUP_TOOL] : []),
+      ...(this.canSearchProducts() ? [PRODUCT_SEARCH_TOOL] : []),
+    ];
+
+    if (tools.length === 0) {
+      return messages;
+    }
+
+    try {
+      const response = await chatModel.bindTools(tools).invoke(messages);
+      const toolCalls = response.tool_calls ?? [];
+
+      if (toolCalls.length === 0) {
+        return messages;
+      }
+
+      const results = await Promise.all(
+        toolCalls.map((toolCall) =>
+          this.runShopifyTool(toolCall.name, toolCall.args, customerPhone),
+        ),
+      );
+
+      return [
+        ...messages,
+        response,
+        ...toolCalls.map(
+          (toolCall, index) =>
+            new ToolMessage({
+              tool_call_id: toolCall.id ?? '',
+              name: toolCall.name,
+              content: results[index],
+            }),
+        ),
+      ];
+    } catch (error) {
+      this.logger.warn(
+        'Shopify lookup failed; replying without shop data',
+        error instanceof Error ? error.stack : String(error),
+      );
+
+      return messages;
+    }
+  }
+
+  private async runShopifyTool(
+    name: string,
+    args: Record<string, unknown>,
+    customerPhone: string,
+  ): Promise<string> {
+    if (
+      name === ORDER_LOOKUP_TOOL_NAME &&
+      this.canLookUpOrders(customerPhone)
+    ) {
+      // The phone comes from the webhook, never from `args`: the model has no
+      // say in whose orders get read.
+      const orders =
+        await this.shopifyService!.findOrdersForPhone(customerPhone);
+
+      this.logger.log(
+        `Order lookup for ${this.maskPhone(customerPhone)} matched ${orders.length} order(s)`,
+      );
+
+      return this.describeOrders(orders);
+    }
+
+    if (name === PRODUCT_SEARCH_TOOL_NAME && this.canSearchProducts()) {
+      const query = typeof args.query === 'string' ? args.query.trim() : '';
+
+      if (!query) {
+        return 'NO_QUERY: ask the customer which product they mean.';
+      }
+
+      const products = await this.shopifyService!.searchProducts(query);
+
+      this.logger.log(
+        `Product search "${query}" matched ${products.length} product(s)`,
+      );
+
+      return this.describeProducts(products);
+    }
+
+    return `UNAVAILABLE: the ${name} tool is not available right now.`;
+  }
+
+  private describeProducts(products: ProductMatch[]): string {
+    if (products.length === 0) {
+      return (
+        'NO_PRODUCTS_FOUND. The catalogue search returned nothing for that query. ' +
+        'Do not invent a product. Tell the customer you could not find it, and offer ' +
+        'to pass them to a colleague.'
+      );
+    }
+
+    return products
+      .map((product) =>
+        [
+          product.title,
+          `price: ${product.price}`,
+          `sizes offered: ${product.sizes}`,
+          product.url ? `link: ${product.url}` : 'link: not published online',
+          `about: ${product.description}`,
+        ].join('\n'),
+      )
+      .join('\n\n');
+  }
+
+  private describeOrders(orders: CustomerOrder[]): string {
+    if (orders.length === 0) {
+      return (
+        'NO_ORDERS_FOUND. No order in the shop is registered to this customer’s ' +
+        'WhatsApp number. Do not invent an order and do not ask them for an order ' +
+        'number to look one up. Tell them you cannot find an order under their ' +
+        'number, and flag the conversation for a human colleague to check.'
+      );
+    }
+
+    return orders
+      .map((order) => {
+        const items =
+          order.items
+            .map((item) => `${item.quantity}x ${item.title}`)
+            .join(', ') || 'unknown items';
+        const tracking =
+          order.tracking
+            .filter((entry) => entry.number)
+            .map((entry) =>
+              [entry.company, entry.number, entry.url]
+                .filter(Boolean)
+                .join(' '),
+            )
+            .join('; ') || 'not shipped yet, no tracking number';
+
+        return [
+          `Order ${order.name}`,
+          `placed: ${order.createdAt}`,
+          `fulfillment: ${order.fulfillmentStatus}`,
+          `payment: ${order.financialStatus}`,
+          `total: ${order.total}`,
+          `items: ${items}`,
+          `tracking: ${tracking}`,
+        ].join('\n');
+      })
+      .join('\n\n');
+  }
+
+  private maskPhone(phone: string): string {
+    return phone.length <= 4 ? '****' : `****${phone.slice(-4)}`;
   }
 
   private async generateAdvisorReply(
