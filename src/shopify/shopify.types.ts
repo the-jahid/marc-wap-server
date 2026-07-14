@@ -36,6 +36,8 @@ export type AbandonedCheckout = {
   /** The Shopify recovery link that re-opens this exact cart. */
   recoveryUrl: string | null;
   customerFirstName: string | null;
+  /** Customer email captured at checkout, or null. */
+  email: string | null;
   /** Best contact phone, normalized to dialable digits (country code included), or null. */
   phone: string | null;
   total: string;
@@ -52,7 +54,11 @@ export type AbandonedCheckoutsPage = {
         completedAt: string | null;
         abandonedCheckoutUrl: string | null;
         totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
-        customer: { firstName: string | null; phone: string | null } | null;
+        customer: {
+          firstName: string | null;
+          phone: string | null;
+          email: string | null;
+        } | null;
         billingAddress: { phone: string | null } | null;
         shippingAddress: { phone: string | null } | null;
         lineItems: { edges: { node: { title: string; quantity: number } }[] };

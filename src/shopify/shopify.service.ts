@@ -92,7 +92,7 @@ const ABANDONED_CHECKOUTS_QUERY = `
           completedAt
           abandonedCheckoutUrl
           totalPriceSet { shopMoney { amount currencyCode } }
-          customer { firstName phone }
+          customer { firstName phone email }
           billingAddress { phone }
           shippingAddress { phone }
           lineItems(first: 10) {
@@ -382,6 +382,7 @@ export class ShopifyService {
       completedAt: node.completedAt ?? null,
       recoveryUrl: node.abandonedCheckoutUrl ?? null,
       customerFirstName: node.customer?.firstName ?? null,
+      email: node.customer?.email?.trim() || null,
       phone: normalizePhone(rawPhone),
       total: `${node.totalPriceSet.shopMoney.amount} ${node.totalPriceSet.shopMoney.currencyCode}`,
       items: node.lineItems.edges.map(({ node: item }) => ({

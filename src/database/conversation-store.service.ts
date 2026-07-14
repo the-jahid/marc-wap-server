@@ -119,6 +119,38 @@ export class ConversationStoreService
     return result.rows;
   }
 
+  /**
+   * How the customer has engaged since a reference time (e.g. the moment their
+   * abandoned-cart reminder was sent): whether they wrote back at all, and
+   * whether any reply was flagged for a human. Abandoned-checkout recovery uses
+   * this to stop chasing a customer who replied and to record a hand-off.
+   */
+  async getEngagementSince(
+    phoneNumber: string,
+    since: string,
+  ): Promise<{ inboundCount: number; needsHumanAttention: boolean }> {
+    const result = await this.pool.query<{
+      inbound: string;
+      needs_human: boolean;
+    }>(
+      `
+        SELECT
+          COUNT(*) FILTER (WHERE role = 'USER')::int AS inbound,
+          bool_or("needsHumanAttention") AS needs_human
+        FROM "ConversationMessage"
+        WHERE "phoneNumber" = $1 AND "createdAt" > $2
+      `,
+      [phoneNumber, since],
+    );
+
+    const row = result.rows[0];
+
+    return {
+      inboundCount: Number(row?.inbound ?? 0),
+      needsHumanAttention: row?.needs_human === true,
+    };
+  }
+
   async saveMessage(
     phoneNumber: string,
     role: ConversationRole,

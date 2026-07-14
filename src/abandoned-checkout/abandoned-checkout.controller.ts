@@ -6,12 +6,18 @@ import {
   HttpCode,
   Post,
   Put,
+  Query,
 } from '@nestjs/common';
 import {
   AbandonedCheckoutConfigStore,
   DEFAULT_REMINDER_MESSAGE,
+  DEFAULT_SECOND_REMINDER_MESSAGE,
   type AbandonedCheckoutConfig,
 } from './abandoned-checkout-config.store';
+import {
+  AbandonedCheckoutReminderStore,
+  type ReminderRecord,
+} from './abandoned-checkout-reminder.store';
 import { AbandonedCheckoutService } from './abandoned-checkout.service';
 import type {
   AbandonedCheckoutRunResult,
@@ -21,15 +27,22 @@ import type {
 const MAX_MESSAGE_LENGTH = 1024;
 const MIN_DELAY_MINUTES = 1;
 const MAX_DELAY_MINUTES = 7 * 24 * 60;
+const MIN_SECOND_DELAY_HOURS = 1;
+const MAX_SECOND_DELAY_HOURS = 7 * 24;
+const MAX_RECORDS = 500;
 
 type AbandonedCheckoutConfigInput = {
   enabled?: unknown;
   messageTemplate?: unknown;
   delayMinutes?: unknown;
+  secondReminderEnabled?: unknown;
+  secondMessageTemplate?: unknown;
+  secondDelayHours?: unknown;
 };
 
 type AbandonedCheckoutConfigResponse = AbandonedCheckoutConfig & {
   defaultMessageTemplate: string;
+  defaultSecondMessageTemplate: string;
   infrastructureReady: boolean;
   pollMinutes: number;
   lookbackHours: number;
@@ -40,6 +53,7 @@ export class AbandonedCheckoutController {
   constructor(
     private readonly service: AbandonedCheckoutService,
     private readonly configStore: AbandonedCheckoutConfigStore,
+    private readonly reminderStore: AbandonedCheckoutReminderStore,
   ) {}
 
   /** Current configuration and whether the recovery poller is running. */
@@ -56,13 +70,7 @@ export class AbandonedCheckoutController {
       this.service.getStatus(),
     ]);
 
-    return {
-      ...config,
-      defaultMessageTemplate: DEFAULT_REMINDER_MESSAGE,
-      infrastructureReady: status.infrastructureReady,
-      pollMinutes: status.pollMinutes,
-      lookbackHours: status.lookbackHours,
-    };
+    return this.toConfigResponse(config, status);
   }
 
   @Put('config')
@@ -82,39 +90,65 @@ export class AbandonedCheckoutController {
       );
     }
 
-    if (messageTemplate.length > MAX_MESSAGE_LENGTH) {
+    this.assertMessageLength(messageTemplate, 'reminder message');
+
+    const delayMinutes = this.parseInteger(
+      body.delayMinutes,
+      MIN_DELAY_MINUTES,
+      MAX_DELAY_MINUTES,
+      `Delay must be a whole number of minutes between ${MIN_DELAY_MINUTES} and ${MAX_DELAY_MINUTES}`,
+    );
+
+    const secondReminderEnabled = body.secondReminderEnabled === true;
+
+    const secondMessageTemplate =
+      typeof body.secondMessageTemplate === 'string'
+        ? body.secondMessageTemplate.trim()
+        : '';
+
+    if (enabled && secondReminderEnabled && !secondMessageTemplate) {
       throw new BadRequestException(
-        `The reminder message cannot exceed ${MAX_MESSAGE_LENGTH} characters`,
+        'A second reminder message is required when the follow-up is enabled',
       );
     }
 
-    const delayMinutes = Number(body.delayMinutes);
+    this.assertMessageLength(secondMessageTemplate, 'second reminder message');
 
-    if (
-      !Number.isFinite(delayMinutes) ||
-      !Number.isInteger(delayMinutes) ||
-      delayMinutes < MIN_DELAY_MINUTES ||
-      delayMinutes > MAX_DELAY_MINUTES
-    ) {
-      throw new BadRequestException(
-        `Delay must be a whole number of minutes between ${MIN_DELAY_MINUTES} and ${MAX_DELAY_MINUTES}`,
-      );
-    }
+    const secondDelayHours = this.parseInteger(
+      body.secondDelayHours,
+      MIN_SECOND_DELAY_HOURS,
+      MAX_SECOND_DELAY_HOURS,
+      `The follow-up delay must be a whole number of hours between ${MIN_SECOND_DELAY_HOURS} and ${MAX_SECOND_DELAY_HOURS}`,
+    );
 
     const saved = await this.configStore.updateConfig({
       enabled,
       messageTemplate: messageTemplate || DEFAULT_REMINDER_MESSAGE,
       delayMinutes,
+      secondReminderEnabled,
+      secondMessageTemplate:
+        secondMessageTemplate || DEFAULT_SECOND_REMINDER_MESSAGE,
+      secondDelayHours,
     });
     const status = await this.service.getStatus();
 
-    return {
-      ...saved,
-      defaultMessageTemplate: DEFAULT_REMINDER_MESSAGE,
-      infrastructureReady: status.infrastructureReady,
-      pollMinutes: status.pollMinutes,
-      lookbackHours: status.lookbackHours,
-    };
+    return this.toConfigResponse(saved, status);
+  }
+
+  /**
+   * The recorded database of every cart the flow has touched: contact details,
+   * abandoned items, the recovery link, when each reminder was sent, and the
+   * current status. Powers the dashboard's recovery table.
+   */
+  @Get('records')
+  listRecords(@Query('limit') limit?: string): Promise<ReminderRecord[]> {
+    const parsed = Number(limit);
+    const size =
+      Number.isFinite(parsed) && parsed > 0
+        ? Math.min(Math.floor(parsed), MAX_RECORDS)
+        : 200;
+
+    return this.reminderStore.list(size);
   }
 
   /**
@@ -126,5 +160,47 @@ export class AbandonedCheckoutController {
   @HttpCode(200)
   run(): Promise<AbandonedCheckoutRunResult> {
     return this.service.runOnce();
+  }
+
+  private toConfigResponse(
+    config: AbandonedCheckoutConfig,
+    status: AbandonedCheckoutStatus,
+  ): AbandonedCheckoutConfigResponse {
+    return {
+      ...config,
+      defaultMessageTemplate: DEFAULT_REMINDER_MESSAGE,
+      defaultSecondMessageTemplate: DEFAULT_SECOND_REMINDER_MESSAGE,
+      infrastructureReady: status.infrastructureReady,
+      pollMinutes: status.pollMinutes,
+      lookbackHours: status.lookbackHours,
+    };
+  }
+
+  private assertMessageLength(message: string, label: string): void {
+    if (message.length > MAX_MESSAGE_LENGTH) {
+      throw new BadRequestException(
+        `The ${label} cannot exceed ${MAX_MESSAGE_LENGTH} characters`,
+      );
+    }
+  }
+
+  private parseInteger(
+    value: unknown,
+    min: number,
+    max: number,
+    message: string,
+  ): number {
+    const parsed = Number(value);
+
+    if (
+      !Number.isFinite(parsed) ||
+      !Number.isInteger(parsed) ||
+      parsed < min ||
+      parsed > max
+    ) {
+      throw new BadRequestException(message);
+    }
+
+    return parsed;
   }
 }
