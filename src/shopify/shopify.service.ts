@@ -6,12 +6,18 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { normalizePhone, phonesMatch } from './phone';
 import { summarizeVariants } from './variants';
+import {
+  canonicalGarmentType,
+  classifyGarmentType,
+  extractColors,
+} from './products';
 import type {
   AbandonedCheckout,
   AbandonedCheckoutsPage,
   CustomerOrder,
   OrdersPage,
   ProductMatch,
+  ProductSearchResult,
   ProductSearchPage,
 } from './shopify.types';
 
@@ -20,7 +26,10 @@ const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const ORDERS_PER_PAGE = 250;
 const MAX_ORDERS_SCANNED = 1000;
 const MAX_ORDERS_RETURNED = 5;
-const MAX_PRODUCTS_RETURNED = 3;
+// A colour/style question must consider the whole product family.  Three is
+// enough for a conversational product recommendation, but not for a family
+// whose colours are individual Shopify products.
+const MAX_PRODUCTS_RETURNED = 100;
 const MAX_VARIANTS_PER_PRODUCT = 250;
 const MAX_DESCRIPTION_CHARS = 300;
 const ABANDONED_CHECKOUTS_PER_PAGE = 100;
@@ -33,6 +42,9 @@ const PRODUCT_SEARCH_QUERY = `
       edges {
         node {
           title
+          productType
+          tags
+          options { name values }
           description
           onlineStoreUrl
           priceRange { minVariantPrice { amount currencyCode } }
@@ -144,32 +156,114 @@ export class ShopifyService {
   }
 
   /**
-   * Products matching a free-text query, via the public Storefront API.
-   *
-   * Shopify's product search is keyword-based, not semantic: "sujetador sin
-   * aros" happily returns bras *con* aros, because it matches "sujetador" and
-   * ignores the negation. Callers must treat these as candidates to be checked
-   * against the customer's request, not as answers.
+   * Finds every published, active product in a named style family, then applies
+   * the garment filter locally.  The local filter is intentional: title is the
+   * only consistently populated classification field in this catalogue, while
+   * product type and tags are useful fallbacks.
    */
-  async searchProducts(query: string): Promise<ProductMatch[]> {
+  async searchProducts(query: string): Promise<ProductSearchResult> {
+    const model = this.extractModel(query);
+    const requestedType = canonicalGarmentType(query);
     const page = await this.storefrontGraphql<ProductSearchPage>(
       PRODUCT_SEARCH_QUERY,
       {
-        query,
+        // Search the model/style alone. Do not add the colour or garment word:
+        // colours often live in a separate product title and garment metadata is
+        // inconsistent. Storefront exposes only products published to this
+        // sales channel, so drafts and archived products are not candidates.
+        query: `title:${this.quoteSearchTerm(model)}`,
         first: MAX_PRODUCTS_RETURNED,
         variants: MAX_VARIANTS_PER_PRODUCT,
       },
     );
 
-    return page.products.edges.map(({ node }) => ({
-      title: node.title,
-      url: node.onlineStoreUrl,
-      price: `${node.priceRange.minVariantPrice.amount} ${node.priceRange.minVariantPrice.currencyCode}`,
-      description: this.trimDescription(node.description),
-      sizes: summarizeVariants(
-        node.variants.edges.map(({ node: variant }) => variant),
-      ),
-    }));
+    const family = page.products.edges
+      .map(({ node }) => {
+        // Read product-level options as well as variant selections. The former
+        // is the canonical list of colour values; the latter protects us from
+        // imperfect catalogues where a value only appears on a variant.
+        const options = new Map(
+          node.options.map((option) => [option.name, new Set(option.values)]),
+        );
+        for (const { node: variant } of node.variants.edges) {
+          for (const option of variant.selectedOptions) {
+            const values = options.get(option.name) ?? new Set<string>();
+            values.add(option.value);
+            options.set(option.name, values);
+          }
+        }
+
+        const optionsForColors = [...options].map(([name, values]) => ({
+          name,
+          values: [...values],
+        }));
+
+        return {
+          title: node.title,
+          url: node.onlineStoreUrl,
+          price: `${node.priceRange.minVariantPrice.amount} ${node.priceRange.minVariantPrice.currencyCode}`,
+          description: this.trimDescription(node.description),
+          sizes: summarizeVariants(
+            node.variants.edges.map(({ node: variant }) => variant),
+          ),
+          colors: extractColors(node.title, optionsForColors),
+          garmentType: classifyGarmentType(
+            node.title,
+            node.productType,
+            node.tags,
+          ),
+        } satisfies ProductMatch;
+      })
+      // Shopify keyword matching can return a related product without the
+      // style in its title. The requested model is a hard requirement.
+      .filter((product) =>
+        product.title.toLocaleLowerCase().includes(model.toLocaleLowerCase()),
+      );
+
+    // Never substitute matching panties (or another related garment) when a
+    // customer explicitly asked for bras. An empty result is more truthful.
+    const matches = requestedType
+      ? family.filter((product) => product.garmentType === requestedType)
+      : family;
+
+    return {
+      model,
+      requestedType,
+      matches,
+      colors: this.uniqueColors(matches.flatMap((product) => product.colors)),
+      broadened: false,
+    };
+  }
+
+  private extractModel(query: string): string {
+    const withoutGarment = query
+      .replace(
+        /\b(bra|bras|sujetador(?:es)?|brasier|bralette|soutien|pant(?:y|ies)|braga(?:s|uita)?|tanga|culotte|brief|body|bodysuit|faja|shaper|set|conjunto)\b/gi,
+        ' ',
+      )
+      .replace(
+        /\b(do|you|have|the|a|an|in|other|different|colors?|colou?rs?|que|hay|ten[ei]s|en|el|la|los|las|de|otros?|diferentes?)\b/gi,
+        ' ')
+      .replace(/[^\p{L}\p{N}'-]+/gu, ' ')
+      .trim();
+
+    // The model normally passes only the product words. If it did not, keep
+    // the original input rather than issuing an empty, store-wide query.
+    return withoutGarment || query.trim();
+  }
+
+  private quoteSearchTerm(value: string): string {
+    return `"${value.replace(/["\\]/g, '\\$&')}"`;
+  }
+
+  private uniqueColors(colors: string[]): string[] {
+    const seen = new Set<string>();
+    return colors.filter((color) => {
+      const key = color.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   private trimDescription(description: string): string {

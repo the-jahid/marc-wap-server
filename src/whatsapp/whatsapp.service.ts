@@ -35,7 +35,10 @@ import { CONVERSATION_STORE } from '../database/conversation-store.constants';
 import type { ConversationStore } from '../database/conversation-store.service';
 import { KnowledgebaseService } from '../knowledgebase/knowledgebase.service';
 import { ShopifyService } from '../shopify/shopify.service';
-import type { CustomerOrder, ProductMatch } from '../shopify/shopify.types';
+import type {
+  CustomerOrder,
+  ProductSearchResult,
+} from '../shopify/shopify.types';
 import { createBraSizeReply } from './bra-size-calculator';
 
 const MAX_CONVERSATION_TURNS = 15;
@@ -139,6 +142,8 @@ const PRODUCT_SEARCH_TOOL = {
       'Call this whenever the customer asks whether a garment exists, what it costs, ' +
       'or whether it comes in their size. Search with the product words the customer used ' +
       '(in Spanish), for example "sujetador reductor" or "faja". ' +
+      'Always call it for colour, colourway, style, or model questions too, and include both ' +
+      'the model name and garment type in the query (for example "Havanna bra"). ' +
       'Results are keyword matches, not exact answers: read the titles and descriptions ' +
       'and only tell the customer about products that genuinely match what they asked for.',
     parameters: {
@@ -168,7 +173,10 @@ const PRODUCT_SEARCH_SYSTEM_PROMPT =
   'The sizes it returns are the combinations the shop offers, and you may tell the customer a size ' +
   'is available to order. You must NOT state stock quantities or promise that an item is physically ' +
   'in the warehouse, because the shop does not track stock levels. Never invent a product, a price ' +
-  'or a size that the tool did not return; if the tool finds nothing that matches, say so plainly.';
+  'or a size that the tool did not return. For a model/style colour question, the tool returns ' +
+  'all colours across every matching product in that garment family: report that colour list, ' +
+  'not just the first product. Do not mention related garments (such as panties) unless the ' +
+  'customer asked about them. If the tool finds nothing that matches, say so plainly.';
 
 @Injectable()
 export class WhatsappService {
@@ -451,7 +459,7 @@ export class WhatsappService {
       const products = await this.shopifyService!.searchProducts(query);
 
       this.logger.log(
-        `Product search "${query}" matched ${products.length} product(s)`,
+        `Product search "${query}" matched ${products.matches.length} product(s)`,
       );
 
       return this.describeProducts(products);
@@ -460,8 +468,8 @@ export class WhatsappService {
     return `UNAVAILABLE: the ${name} tool is not available right now.`;
   }
 
-  private describeProducts(products: ProductMatch[]): string {
-    if (products.length === 0) {
+  private describeProducts(result: ProductSearchResult): string {
+    if (result.matches.length === 0) {
       return (
         'NO_PRODUCTS_FOUND. The catalogue search returned nothing for that query. ' +
         'Do not invent a product. Tell the customer you could not find it, and offer ' +
@@ -469,17 +477,23 @@ export class WhatsappService {
       );
     }
 
-    return products
-      .map((product) =>
+    const colors = result.colors.length
+      ? `COLOURS FOR ${result.model}: ${result.colors.join(', ')}`
+      : `COLOURS FOR ${result.model}: no colour information is recorded in Shopify.`;
+
+    return [
+      colors,
+      ...result.matches.map((product) =>
         [
           product.title,
+          `colours on this product: ${product.colors.join(', ') || 'not recorded'}`,
           `price: ${product.price}`,
           `sizes offered: ${product.sizes}`,
           product.url ? `link: ${product.url}` : 'link: not published online',
           `about: ${product.description}`,
         ].join('\n'),
-      )
-      .join('\n\n');
+      ),
+    ].join('\n\n');
   }
 
   private describeOrders(orders: CustomerOrder[]): string {

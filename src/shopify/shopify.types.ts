@@ -19,12 +19,33 @@ export type CustomerOrder = {
   tracking: OrderTracking[];
 };
 
+import type { GarmentType } from './products';
+
 export type ProductMatch = {
   title: string;
   url: string | null;
   price: string;
   description: string;
   sizes: string;
+  /** Every colour the product is offered in, read from its title and COLOR option. */
+  colors: string[];
+  /** Canonical garment type inferred from the title, or null when unrecognised. */
+  garmentType: GarmentType | null;
+};
+
+/**
+ * The outcome of a catalogue search for one model/style. `matches` are the
+ * products of the requested garment type (or the whole family when none was
+ * requested), and `colors` aggregates the colours across those matches so the
+ * caller can answer "which colours does it come in?" directly.
+ */
+export type ProductSearchResult = {
+  model: string;
+  requestedType: GarmentType | null;
+  matches: ProductMatch[];
+  colors: string[];
+  /** Reserved for a future explicitly-requested relaxed search; never true for an explicit garment request. */
+  broadened: boolean;
 };
 
 export type AbandonedCheckout = {
@@ -72,6 +93,9 @@ export type ProductSearchPage = {
     edges: {
       node: {
         title: string;
+        productType: string;
+        tags: string[];
+        options: { name: string; values: string[] }[];
         description: string;
         onlineStoreUrl: string | null;
         priceRange: {
