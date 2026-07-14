@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { AbandonedCheckoutModule } from './abandoned-checkout/abandoned-checkout.module';
 import { AgentConfigModule } from './agent-config/agent-config.module';
 import { ConversationsModule } from './conversations/conversations.module';
 import { DatabaseModule } from './database/database.module';
@@ -16,6 +17,7 @@ import { WhatsappModule } from './whatsapp/whatsapp.module';
     KnowledgebaseModule,
     ConversationsModule,
     WhatsappModule,
+    AbandonedCheckoutModule,
   ],
   controllers: [AppController],
   providers: [AppService],

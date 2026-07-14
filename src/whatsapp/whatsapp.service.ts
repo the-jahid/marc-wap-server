@@ -209,6 +209,24 @@ export class WhatsappService {
     await this.sendWhatsAppText(to, body);
   }
 
+  /**
+   * True when the server has what it needs to start a WhatsApp conversation on
+   * its own: an access token and a configured phone number id. Inbound replies
+   * can borrow the phone number id from the webhook, but a business-initiated
+   * message (such as an abandoned-checkout reminder) has no webhook to borrow
+   * from, so the id must be configured.
+   */
+  canSendMessages(): boolean {
+    const token =
+      this.configService.get<string>('WHATSAPP_ACCESS_TOKEN')?.trim() ||
+      this.configService.get<string>('WHATSAPP_API_KEY')?.trim();
+    const phoneNumberId = this.configService
+      .get<string>('WHATSAPP_PHONE_NUMBER_ID')
+      ?.trim();
+
+    return Boolean(token && phoneNumberId);
+  }
+
   async processWebhook(
     payload: WhatsappWebhookPayload,
   ): Promise<WhatsappWebhookResult> {

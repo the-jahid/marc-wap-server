@@ -4,9 +4,11 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { phonesMatch } from './phone';
+import { normalizePhone, phonesMatch } from './phone';
 import { summarizeVariants } from './variants';
 import type {
+  AbandonedCheckout,
+  AbandonedCheckoutsPage,
   CustomerOrder,
   OrdersPage,
   ProductMatch,
@@ -21,6 +23,9 @@ const MAX_ORDERS_RETURNED = 5;
 const MAX_PRODUCTS_RETURNED = 3;
 const MAX_VARIANTS_PER_PRODUCT = 250;
 const MAX_DESCRIPTION_CHARS = 300;
+const ABANDONED_CHECKOUTS_PER_PAGE = 100;
+const MAX_ABANDONED_CHECKOUTS_SCANNED = 500;
+const MAX_ABANDONED_CHECKOUTS_RETURNED = 100;
 
 const PRODUCT_SEARCH_QUERY = `
   query SearchProducts($query: String!, $first: Int!, $variants: Int!) {
@@ -64,6 +69,34 @@ const ORDERS_QUERY = `
           }
           fulfillments(first: 5) {
             trackingInfo { number company url }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const ABANDONED_CHECKOUTS_QUERY = `
+  query AbandonedCheckouts($first: Int!, $after: String) {
+    abandonedCheckouts(
+      first: $first
+      after: $after
+      sortKey: CREATED_AT
+      reverse: true
+    ) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+          id
+          createdAt
+          completedAt
+          abandonedCheckoutUrl
+          totalPriceSet { shopMoney { amount currencyCode } }
+          customer { firstName phone }
+          billingAddress { phone }
+          shippingAddress { phone }
+          lineItems(first: 10) {
+            edges { node { title quantity } }
           }
         }
       }
@@ -261,6 +294,101 @@ export class ShopifyService {
     }
 
     return matches;
+  }
+
+  /**
+   * Recently abandoned checkouts, newest first, aged into a recovery window.
+   *
+   * Only checkouts whose age is between `delayMs` (they have had time to be
+   * abandoned) and `lookbackMs` (recent enough to still be worth chasing) are
+   * returned. `completedAt` is left on each result so the caller can make the
+   * "the order has not been completed" check itself; a checkout that later
+   * turned into a paid order still appears here with `completedAt` set.
+   *
+   * Results are sorted newest first, so paging stops as soon as a checkout is
+   * older than the lookback window rather than walking the whole history.
+   */
+  async findRecentAbandonedCheckouts(options: {
+    delayMs: number;
+    lookbackMs: number;
+    now?: number;
+  }): Promise<AbandonedCheckout[]> {
+    const now = options.now ?? Date.now();
+    const oldestAllowed = now - options.lookbackMs;
+    const newestAllowed = now - options.delayMs;
+
+    const matches: AbandonedCheckout[] = [];
+    let cursor: string | undefined;
+    let scanned = 0;
+
+    while (scanned < MAX_ABANDONED_CHECKOUTS_SCANNED) {
+      const page = await this.adminGraphql<AbandonedCheckoutsPage>(
+        ABANDONED_CHECKOUTS_QUERY,
+        {
+          first: ABANDONED_CHECKOUTS_PER_PAGE,
+          after: cursor ?? null,
+        },
+      );
+
+      for (const { node } of page.abandonedCheckouts.edges) {
+        scanned += 1;
+
+        const createdAtMs = Date.parse(node.createdAt);
+
+        // Newest first: once we reach a checkout older than the window, every
+        // remaining checkout is older too, so we can stop entirely.
+        if (Number.isFinite(createdAtMs) && createdAtMs < oldestAllowed) {
+          return matches;
+        }
+
+        // Too fresh to have been abandoned yet; skip but keep scanning older ones.
+        if (Number.isFinite(createdAtMs) && createdAtMs > newestAllowed) {
+          continue;
+        }
+
+        matches.push(this.toAbandonedCheckout(node));
+
+        if (matches.length >= MAX_ABANDONED_CHECKOUTS_RETURNED) {
+          return matches;
+        }
+      }
+
+      if (!page.abandonedCheckouts.pageInfo.hasNextPage) {
+        break;
+      }
+
+      cursor = page.abandonedCheckouts.pageInfo.endCursor ?? undefined;
+
+      if (!cursor) {
+        break;
+      }
+    }
+
+    return matches;
+  }
+
+  private toAbandonedCheckout(
+    node: AbandonedCheckoutsPage['abandonedCheckouts']['edges'][number]['node'],
+  ): AbandonedCheckout {
+    const rawPhone =
+      node.customer?.phone ??
+      node.shippingAddress?.phone ??
+      node.billingAddress?.phone ??
+      null;
+
+    return {
+      id: node.id,
+      createdAt: node.createdAt,
+      completedAt: node.completedAt ?? null,
+      recoveryUrl: node.abandonedCheckoutUrl ?? null,
+      customerFirstName: node.customer?.firstName ?? null,
+      phone: normalizePhone(rawPhone),
+      total: `${node.totalPriceSet.shopMoney.amount} ${node.totalPriceSet.shopMoney.currencyCode}`,
+      items: node.lineItems.edges.map(({ node: item }) => ({
+        title: item.title,
+        quantity: item.quantity,
+      })),
+    };
   }
 
   async adminGraphql<T>(

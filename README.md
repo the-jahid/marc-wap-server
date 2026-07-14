@@ -72,6 +72,60 @@ https://your-domain.com/webhooks/whatsapp
 
 Subscribe the WhatsApp webhook to `messages`.
 
+## Abandoned Checkout Recovery
+
+The server can win back abandoned Shopify checkouts over WhatsApp. It polls
+Shopify on an interval and, for each checkout that has been abandoned long
+enough, sends the customer a plain WhatsApp text message — written and edited by
+the operator in the dashboard (Cart Recovery tab) — with the cart recovery link
+filled in. When the customer replies, the normal inbound agent flow takes over:
+it answers questions about size, model, shipping, exchanges or payment, resends
+the link if they want to buy, and flags the conversation for a human advisor
+when it cannot resolve the request.
+
+How a checkout is chosen each cycle:
+
+1. Shopify lists checkouts that were started but not completed.
+2. Only checkouts older than the configured delay (default 60 min) are
+   considered — this is the "wait 60 minutes" step, made restart-safe by polling
+   instead of per-cart timers.
+3. Checkouts that were since completed (`completedAt` is set) are skipped.
+4. Checkouts without a valid, dialable phone number are skipped.
+5. Each checkout is claimed atomically in the `AbandonedCheckoutReminder` table,
+   so a customer is never messaged twice about the same cart — even across
+   restarts or multiple instances.
+6. The operator's message is rendered with `{{name}}` (customer first name) and
+   `{{link}}` (recovery URL) and sent as a WhatsApp text.
+
+The reminder message, the wait time, and the on/off switch are stored in the
+`AbandonedCheckoutConfig` table and edited from the dashboard, so no message
+template lives in the environment. The poller runs whenever Shopify Admin API
+credentials (`SHOPIFY_STORE`, `SHOPIFY_CLIENT_ID`, `SHOPIFY_CLIENT_SECRET`) and
+a configured `WHATSAPP_PHONE_NUMBER_ID` are present, but it only sends once the
+operator switches recovery **on** — so flipping it on or off in the dashboard
+takes effect without a redeploy. `ABANDONED_CHECKOUT_POLL_MINUTES` (default 5)
+and `ABANDONED_CHECKOUT_LOOKBACK_HOURS` (default 24) tune the poll cadence and
+scan window.
+
+> **WhatsApp policy note:** the Cloud API only delivers a free-form text message
+> to a customer who has messaged your number within the last 24 hours. A shopper
+> who abandoned a checkout usually has **not**, so Meta will reject these
+> reminders (error 131047) unless there is an open 24-hour window. Delivering
+> reliably to cold contacts requires an approved Meta message template; this
+> feature deliberately uses editable text instead, per product decision.
+
+Endpoints:
+
+```text
+GET  /abandoned-checkouts/status   # poller state (running, enabled, timings)
+GET  /abandoned-checkouts/config   # the editable reminder settings
+PUT  /abandoned-checkouts/config   # update message / delay / on-off
+POST /abandoned-checkouts/run      # run one recovery pass now (testing / external cron)
+```
+
+`POST /abandoned-checkouts/run` lets an external scheduler (for example a Render
+cron job) drive the pass instead of the built-in interval.
+
 ## Test
 
 ```bash

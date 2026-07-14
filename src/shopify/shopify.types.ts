@@ -27,6 +27,40 @@ export type ProductMatch = {
   sizes: string;
 };
 
+export type AbandonedCheckout = {
+  /** Shopify GID, e.g. gid://shopify/AbandonedCheckout/123. Used as the dedupe key. */
+  id: string;
+  createdAt: string;
+  /** Set once the checkout became a paid order; null while still abandoned. */
+  completedAt: string | null;
+  /** The Shopify recovery link that re-opens this exact cart. */
+  recoveryUrl: string | null;
+  customerFirstName: string | null;
+  /** Best contact phone, normalized to dialable digits (country code included), or null. */
+  phone: string | null;
+  total: string;
+  items: OrderItem[];
+};
+
+export type AbandonedCheckoutsPage = {
+  abandonedCheckouts: {
+    pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    edges: {
+      node: {
+        id: string;
+        createdAt: string;
+        completedAt: string | null;
+        abandonedCheckoutUrl: string | null;
+        totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+        customer: { firstName: string | null; phone: string | null } | null;
+        billingAddress: { phone: string | null } | null;
+        shippingAddress: { phone: string | null } | null;
+        lineItems: { edges: { node: { title: string; quantity: number } }[] };
+      };
+    }[];
+  };
+};
+
 export type ProductSearchPage = {
   products: {
     edges: {
