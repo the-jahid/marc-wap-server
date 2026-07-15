@@ -302,9 +302,8 @@ export class KnowledgebaseService implements OnModuleInit {
     let documentTextService = this.documentTextService;
 
     if (!documentTextService) {
-      const { DocumentTextService } = await import(
-        './document-text.service.js'
-      );
+      const { DocumentTextService } =
+        await import('./document-text.service.js');
 
       documentTextService = new DocumentTextService();
       this.documentTextService = documentTextService;
@@ -317,9 +316,8 @@ export class KnowledgebaseService implements OnModuleInit {
     let vectorService = this.vectorService;
 
     if (!vectorService) {
-      const { KnowledgebaseVectorService } = await import(
-        './knowledgebase-vector.service.js'
-      );
+      const { KnowledgebaseVectorService } =
+        await import('./knowledgebase-vector.service.js');
 
       vectorService = new KnowledgebaseVectorService(this.configService);
       this.vectorService = vectorService;
@@ -344,8 +342,8 @@ export class KnowledgebaseService implements OnModuleInit {
 
     return Boolean(
       openAiApiKey &&
-        pineconeApiKey &&
-        (pineconeIndexName || pineconeIndexHost),
+      pineconeApiKey &&
+      (pineconeIndexName || pineconeIndexHost),
     );
   }
 

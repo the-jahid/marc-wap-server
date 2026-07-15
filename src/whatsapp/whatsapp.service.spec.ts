@@ -49,6 +49,93 @@ describe('WhatsappService', () => {
     );
   });
 
+  it('converts Markdown formatting to WhatsApp-native formatting before sending', async () => {
+    const service = new WhatsappService(configService);
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+
+    const aiReply = [
+      'Sí, tenemos el **sujetador Deauville** en catálogo. Es un **sujetador reductor con aros**.',
+      '',
+      'Aparece en estos colores:',
+      '',
+      '•⁠ ⁠**Beige** – **114 €**',
+      '•⁠ ⁠**Negro** – **114 €**',
+      '- **Natural** – **114 €**',
+    ].join('\n');
+
+    await service.sendManualText('15551234567', aiReply);
+
+    const requestInit = fetchMock.mock.calls[0][1] as RequestInit;
+    const sentBody = JSON.parse(requestInit.body as string) as {
+      text: { body: string };
+    };
+
+    expect(sentBody.text.body).toBe(
+      [
+        'Sí, tenemos el *sujetador Deauville* en catálogo. Es un *sujetador reductor con aros*.',
+        '',
+        'Aparece en estos colores:',
+        '',
+        '- *Beige* – *114 €*',
+        '- *Negro* – *114 €*',
+        '- *Natural* – *114 €*',
+      ].join('\n'),
+    );
+    expect(sentBody.text.body).not.toContain('**');
+
+    fetchMock.mockRestore();
+  });
+
+  it('strips stray formatting symbols so the customer never sees them', async () => {
+    const service = new WhatsappService(configService);
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+
+    await service.sendManualText(
+      '15551234567',
+      'Aquí tienes un `código` y un asterisco suelto * y una lista:\n' +
+        '- _cursiva_ ~~tachado~~',
+    );
+
+    const requestInit = fetchMock.mock.calls[0][1] as RequestInit;
+    const sentBody = JSON.parse(requestInit.body as string) as {
+      text: { body: string };
+    };
+
+    expect(sentBody.text.body).toBe(
+      'Aquí tienes un código y un asterisco suelto y una lista:\n' +
+        '- _cursiva_ ~tachado~',
+    );
+
+    fetchMock.mockRestore();
+  });
+
+  it('leaves URLs untouched when cleaning formatting', async () => {
+    const service = new WhatsappService(configService);
+    const fetchMock = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+
+    await service.sendManualText(
+      '15551234567',
+      'Míralo aquí: https://shop.example.com/producto_deauville~beige y avísame.',
+    );
+
+    const requestInit = fetchMock.mock.calls[0][1] as RequestInit;
+    const sentBody = JSON.parse(requestInit.body as string) as {
+      text: { body: string };
+    };
+
+    expect(sentBody.text.body).toBe(
+      'Míralo aquí: https://shop.example.com/producto_deauville~beige y avísame.',
+    );
+
+    fetchMock.mockRestore();
+  });
+
   it('processes incoming text messages and ignores duplicate webhook retries', async () => {
     const service = new WhatsappService(configService);
     const serviceInternals = service as unknown as {

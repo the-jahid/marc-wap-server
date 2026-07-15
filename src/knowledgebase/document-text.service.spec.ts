@@ -38,8 +38,8 @@ describe('DocumentTextService', () => {
     const internals = service as unknown as DocumentTextServiceInternals;
     const officeParserSpy = jest
       .spyOn(internals, 'extractOfficeParserText')
-      .mockImplementation(async (_buffer, _fileType, options) =>
-        options?.useOcr ? 'OCR fallback text' : '',
+      .mockImplementation((_buffer, _fileType, options) =>
+        Promise.resolve(options?.useOcr ? 'OCR fallback text' : ''),
       );
 
     jest.spyOn(internals, 'extractPdfText').mockResolvedValue('');

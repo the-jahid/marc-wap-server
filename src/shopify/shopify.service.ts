@@ -26,10 +26,9 @@ const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const ORDERS_PER_PAGE = 250;
 const MAX_ORDERS_SCANNED = 1000;
 const MAX_ORDERS_RETURNED = 5;
-// A colour/style question must consider the whole product family.  Three is
-// enough for a conversational product recommendation, but not for a family
-// whose colours are individual Shopify products.
-const MAX_PRODUCTS_RETURNED = 100;
+// A colour/style question must consider the whole product family, including
+// families that span more than one Storefront API page.
+const PRODUCTS_PER_PAGE = 100;
 const MAX_VARIANTS_PER_PRODUCT = 250;
 const MAX_DESCRIPTION_CHARS = 300;
 const ABANDONED_CHECKOUTS_PER_PAGE = 100;
@@ -37,8 +36,14 @@ const MAX_ABANDONED_CHECKOUTS_SCANNED = 500;
 const MAX_ABANDONED_CHECKOUTS_RETURNED = 100;
 
 const PRODUCT_SEARCH_QUERY = `
-  query SearchProducts($query: String!, $first: Int!, $variants: Int!) {
-    products(first: $first, query: $query) {
+  query SearchProducts(
+    $query: String!
+    $first: Int!
+    $after: String
+    $variants: Int!
+  ) {
+    products(first: $first, after: $after, query: $query) {
+      pageInfo { hasNextPage endCursor }
       edges {
         node {
           title
@@ -164,20 +169,9 @@ export class ShopifyService {
   async searchProducts(query: string): Promise<ProductSearchResult> {
     const model = this.extractModel(query);
     const requestedType = canonicalGarmentType(query);
-    const page = await this.storefrontGraphql<ProductSearchPage>(
-      PRODUCT_SEARCH_QUERY,
-      {
-        // Search the model/style alone. Do not add the colour or garment word:
-        // colours often live in a separate product title and garment metadata is
-        // inconsistent. Storefront exposes only products published to this
-        // sales channel, so drafts and archived products are not candidates.
-        query: `title:${this.quoteSearchTerm(model)}`,
-        first: MAX_PRODUCTS_RETURNED,
-        variants: MAX_VARIANTS_PER_PRODUCT,
-      },
-    );
+    const products = await this.findProductFamily(model);
 
-    const family = page.products.edges
+    const family = products
       .map(({ node }) => {
         // Read product-level options as well as variant selections. The former
         // is the canonical list of colour values; the latter protects us from
@@ -217,7 +211,9 @@ export class ShopifyService {
       // Shopify keyword matching can return a related product without the
       // style in its title. The requested model is a hard requirement.
       .filter((product) =>
-        product.title.toLocaleLowerCase().includes(model.toLocaleLowerCase()),
+        this.normalizeSearchText(product.title).includes(
+          this.normalizeSearchText(model),
+        ),
       );
 
     // Never substitute matching panties (or another related garment) when a
@@ -235,21 +231,177 @@ export class ShopifyService {
     };
   }
 
+  /**
+   * Fetches the complete model/style family. The remote query deliberately
+   * contains only the style name: garment and colour words would hide sibling
+   * products whose catalogue metadata differs.
+   */
+  private async findProductFamily(
+    model: string,
+  ): Promise<ProductSearchPage['products']['edges']> {
+    const edges: ProductSearchPage['products']['edges'] = [];
+    const seenCursors = new Set<string>();
+    let after: string | null = null;
+
+    while (true) {
+      const page: ProductSearchPage =
+        await this.storefrontGraphql<ProductSearchPage>(PRODUCT_SEARCH_QUERY, {
+          // Storefront automatically excludes draft, archived and unpublished
+          // products from this connection.
+          query: `title:${this.quoteSearchTerm(model)}`,
+          first: PRODUCTS_PER_PAGE,
+          after,
+          variants: MAX_VARIANTS_PER_PRODUCT,
+        });
+
+      edges.push(...page.products.edges);
+
+      const { hasNextPage, endCursor } = page.products.pageInfo;
+      if (!hasNextPage || !endCursor || seenCursors.has(endCursor)) {
+        break;
+      }
+
+      seenCursors.add(endCursor);
+      after = endCursor;
+    }
+
+    return edges;
+  }
+
   private extractModel(query: string): string {
-    const withoutGarment = query
-      .replace(
-        /\b(bra|bras|sujetador(?:es)?|brasier|bralette|soutien|pant(?:y|ies)|braga(?:s|uita)?|tanga|culotte|brief|body|bodysuit|faja|shaper|set|conjunto)\b/gi,
-        ' ',
-      )
-      .replace(
-        /\b(do|you|have|the|a|an|in|other|different|colors?|colou?rs?|que|hay|ten[ei]s|en|el|la|los|las|de|otros?|diferentes?)\b/gi,
-        ' ')
-      .replace(/[^\p{L}\p{N}'-]+/gu, ' ')
+    const ignoredWords = new Set([
+      // Garments: the style search is intentionally broader than the final
+      // local garment filter.
+      'bra',
+      'bras',
+      'sujetador',
+      'sujetadores',
+      'brasier',
+      'bralette',
+      'soutien',
+      'gorge',
+      'reggiseno',
+      'panty',
+      'panties',
+      'braga',
+      'bragas',
+      'braguita',
+      'braguitas',
+      'tanga',
+      'tangas',
+      'culotte',
+      'culottes',
+      'brief',
+      'briefs',
+      'body',
+      'bodysuit',
+      'faja',
+      'fajas',
+      'shaper',
+      'shapewear',
+      'set',
+      'conjunto',
+      'conjuntos',
+      // English colour/style question words.
+      'do',
+      'does',
+      'you',
+      'have',
+      'the',
+      'a',
+      'an',
+      'in',
+      'other',
+      'different',
+      'color',
+      'colors',
+      'colour',
+      'colours',
+      'model',
+      'style',
+      'available',
+      'which',
+      'what',
+      'any',
+      'come',
+      'comes',
+      'is',
+      'are',
+      // Spanish colour/style question words (tokens are accent-normalized).
+      'que',
+      'hay',
+      'teneis',
+      'tienes',
+      'tiene',
+      'tienen',
+      'en',
+      'el',
+      'la',
+      'los',
+      'las',
+      'de',
+      'del',
+      'otro',
+      'otros',
+      'otra',
+      'otras',
+      'diferente',
+      'diferentes',
+      'color',
+      'colores',
+      'modelo',
+      'estilo',
+      'disponible',
+      'disponibles',
+      'esta',
+      'estan',
+      'viene',
+      'vienen',
+      // French colour/style question words.
+      'avez',
+      'vous',
+      'as',
+      'tu',
+      'le',
+      'les',
+      'un',
+      'une',
+      'des',
+      'du',
+      'd',
+      'dans',
+      'autre',
+      'autres',
+      'different',
+      'differents',
+      'differente',
+      'differentes',
+      'couleur',
+      'couleurs',
+      'modele',
+      'est',
+      'sont',
+      'existe',
+    ]);
+
+    const words = query.match(/[\p{L}\p{N}]+/gu) ?? [];
+    const withoutGarment = words
+      .filter((word) => !ignoredWords.has(this.normalizeSearchText(word)))
+      .join(' ')
       .trim();
 
     // The model normally passes only the product words. If it did not, keep
     // the original input rather than issuing an empty, store-wide query.
     return withoutGarment || query.trim();
+  }
+
+  private normalizeSearchText(value: string): string {
+    return value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .toLocaleLowerCase()
+      .trim();
   }
 
   private quoteSearchTerm(value: string): string {
@@ -259,7 +411,10 @@ export class ShopifyService {
   private uniqueColors(colors: string[]): string[] {
     const seen = new Set<string>();
     return colors.filter((color) => {
-      const key = color.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+      const key = color
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase();
       if (seen.has(key)) return false;
       seen.add(key);
       return true;

@@ -143,7 +143,8 @@ const PRODUCT_SEARCH_TOOL = {
       'or whether it comes in their size. Search with the product words the customer used ' +
       '(in Spanish), for example "sujetador reductor" or "faja". ' +
       'Always call it for colour, colourway, style, or model questions too, and include both ' +
-      'the model name and garment type in the query (for example "Havanna bra"). ' +
+      'the model name and garment type in the query (for example "Havanna bra"). Keep the ' +
+      'query to those product-identifying words; omit conversational phrases such as "other colors". ' +
       'Results are keyword matches, not exact answers: read the titles and descriptions ' +
       'and only tell the customer about products that genuinely match what they asked for.',
     parameters: {
@@ -175,8 +176,10 @@ const PRODUCT_SEARCH_SYSTEM_PROMPT =
   'in the warehouse, because the shop does not track stock levels. Never invent a product, a price ' +
   'or a size that the tool did not return. For a model/style colour question, the tool returns ' +
   'all colours across every matching product in that garment family: report that colour list, ' +
-  'not just the first product. Do not mention related garments (such as panties) unless the ' +
-  'customer asked about them. If the tool finds nothing that matches, say so plainly.';
+  'not just the first product. Answer the colour question directly; do not ask for a size or ' +
+  'push the customer toward a purchase unless they also asked about sizing or ordering. Do not ' +
+  'mention related garments (such as panties) unless the customer asked about them. If the tool ' +
+  'finds nothing that matches, say so plainly.';
 
 @Injectable()
 export class WhatsappService {
@@ -737,7 +740,7 @@ export class WhatsappService {
           type: 'text',
           text: {
             preview_url: false,
-            body: this.limitWhatsappText(body),
+            body: this.limitWhatsappText(this.formatForWhatsapp(body)),
           },
         }),
       },
@@ -1111,5 +1114,106 @@ export class WhatsappService {
 
   private limitWhatsappText(text: string): string {
     return text.length <= 4096 ? text : `${text.slice(0, 4093)}...`;
+  }
+
+  /**
+   * Turns the Markdown-flavoured text the model produces into WhatsApp-native
+   * formatting. WhatsApp bold/italic/strikethrough use a single marker
+   * (`*bold*`, `_italic_`, `~strike~`); anything else — `**double asterisks**`,
+   * `` `code` ``, fancy bullet glyphs — is shown to the customer as literal
+   * characters. We convert what maps cleanly to a single marker and strip
+   * whatever is left over, so the customer sees real bold text and never a
+   * stray formatting symbol. Malformed or unbalanced markup is removed rather
+   * than passed through: clean plain text beats a visible `*`.
+   */
+  private formatForWhatsapp(text: string): string {
+    if (!text) {
+      return text;
+    }
+
+    // Shield URLs from every transform below: they legitimately contain `_`,
+    // `~` and `*`, and rewriting those would break the link.
+    const urls: string[] = [];
+    const guarded = text.replace(/https?:\/\/\S+/g, (url) => {
+      urls.push(url);
+      return ` U${urls.length - 1} `;
+    });
+
+    const withBullets = this.normalizeListMarkers(guarded);
+    const converted = this.convertMarkdownToWhatsapp(withBullets);
+    const cleaned = this.stripStrayFormatting(converted);
+
+    return cleaned.replace(
+      / U(\d+) /g,
+      (_match, index: string) => urls[Number(index)],
+    );
+  }
+
+  private normalizeListMarkers(text: string): string {
+    return (
+      text
+        .replace(/\r\n/g, '\n')
+        // Drop zero-width and word-joiner characters that ride along with the
+        // fancy bullet glyphs some sources paste in (e.g. "•⁠ ⁠").
+        .replace(/[​-‍⁠﻿]/g, '')
+        // Non-breaking spaces become ordinary spaces.
+        .replace(/ /g, ' ')
+        // Any bullet glyph (or a Markdown "* "/"+ " list marker) at the start
+        // of a line becomes a plain hyphen list marker.
+        .replace(/^[ \t]*[•▪◦‣·●○*+]\s+/gm, '- ')
+    );
+  }
+
+  private convertMarkdownToWhatsapp(text: string): string {
+    return (
+      text
+        // Markdown heading markers ("### Title" -> "Title").
+        .replace(/^[ \t]*#{1,6}[ \t]+/gm, '')
+        // Bold: **text** or __text__ -> *text*
+        .replace(/\*\*(\S(?:.*?\S)?)\*\*/g, '*$1*')
+        .replace(/__(\S(?:.*?\S)?)__/g, '*$1*')
+        // Strikethrough: ~~text~~ -> ~text~
+        .replace(/~~(\S(?:.*?\S)?)~~/g, '~$1~')
+        // Inline code / code fences: drop the backticks, keep the text.
+        .replace(/`+/g, '')
+    );
+  }
+
+  private stripStrayFormatting(text: string): string {
+    // Any `**` still present is unbalanced Markdown the conversion could not
+    // pair up; remove it so the customer never sees the asterisks.
+    let result = text.replace(/\*\*/g, '');
+
+    for (const marker of ['*', '_', '~']) {
+      result = this.removeUnbalancedMarker(result, marker);
+    }
+
+    return result
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/[ \t]+$/gm, '');
+  }
+
+  /**
+   * Keeps only balanced, text-hugging emphasis pairs for a marker (such as
+   * `*bold*`) and removes every other occurrence, so a lone or malformed marker
+   * is sent as clean plain text instead of a visible symbol.
+   */
+  private removeUnbalancedMarker(text: string, marker: string): string {
+    const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pairPattern = new RegExp(
+      `${escaped}(\\S(?:[^${escaped}\\n]*\\S)?)${escaped}`,
+      'g',
+    );
+    const kept: string[] = [];
+    const withoutPairs = text.replace(pairPattern, (_match, content: string) => {
+      kept.push(content);
+      return ` E${kept.length - 1} `;
+    });
+    const stripped = withoutPairs.split(marker).join('');
+
+    return stripped.replace(
+      / E(\d+) /g,
+      (_match, index: string) => `${marker}${kept[Number(index)]}${marker}`,
+    );
   }
 }

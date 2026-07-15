@@ -90,6 +90,7 @@ export type AbandonedCheckoutsPage = {
 
 export type ProductSearchPage = {
   products: {
+    pageInfo: { hasNextPage: boolean; endCursor: string | null };
     edges: {
       node: {
         title: string;

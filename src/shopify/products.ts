@@ -31,13 +31,23 @@ function normalize(value: string): string {
   return value.normalize('NFD').replace(DIACRITICS, '').toLowerCase().trim();
 }
 
+/** Matches catalogue terms as words, so `bra` never matches inside `braga`. */
+function containsKeyword(value: string, keyword: string): boolean {
+  const words = ` ${normalize(value).replace(/[^\p{L}\p{N}]+/gu, ' ')} `;
+  const wanted = ` ${normalize(keyword).replace(/[^\p{L}\p{N}]+/gu, ' ')} `;
+  return words.includes(wanted);
+}
+
 // Checked against the TITLE first (the only consistent signal), then against
 // productType/tags. Order matters: the first canonical type whose keyword is
 // found wins, so more specific garments are listed before looser ones.
 const GARMENT_TYPE_KEYWORDS: [GarmentType, string[]][] = [
   ['body', ['body']],
   ['shaper', ['faja']],
-  ['bra', ['sujetador', 'brasier', 'bralette', 'soutien']],
+  [
+    'bra',
+    ['bra', 'bras', 'sujetador', 'brasier', 'bralette', 'soutien', 'reggiseno'],
+  ],
   ['panty', ['braga', 'braguita', 'tanga', 'culotte', 'brief', 'panty']],
   ['set', ['conjunto']],
 ];
@@ -46,7 +56,10 @@ const GARMENT_TYPE_KEYWORDS: [GarmentType, string[]][] = [
 // words onto our canonical types so "bra", "sujetador" and "soutien" all filter
 // the same way.
 const REQUESTED_TYPE_SYNONYMS: [GarmentType, string[]][] = [
-  ['bra', ['bra', 'sujetador', 'sujetadores', 'brasier', 'soutien', 'reggiseno']],
+  [
+    'bra',
+    ['bra', 'sujetador', 'sujetadores', 'brasier', 'soutien', 'reggiseno'],
+  ],
   [
     'panty',
     [
@@ -130,7 +143,17 @@ const COLOR_TOKENS = new Set(
   ].map(normalize),
 );
 
-const COLOR_OPTION_NAMES = new Set(['color', 'colour', 'colores']);
+const COLOR_OPTION_NAMES = new Set([
+  'color',
+  'colors',
+  'colour',
+  'colours',
+  'colores',
+  'couleur',
+  'couleurs',
+  'colore',
+  'colori',
+]);
 
 /**
  * The canonical garment type for a product, or null when nothing recognisable
@@ -145,7 +168,7 @@ export function classifyGarmentType(
   const normalizedTitle = normalize(title);
 
   for (const [type, keywords] of GARMENT_TYPE_KEYWORDS) {
-    if (keywords.some((keyword) => normalizedTitle.includes(keyword))) {
+    if (keywords.some((keyword) => containsKeyword(normalizedTitle, keyword))) {
       return type;
     }
   }
@@ -153,7 +176,9 @@ export function classifyGarmentType(
   const normalizedFallback = [productType, ...tags].map(normalize).join(' ');
 
   for (const [type, keywords] of GARMENT_TYPE_KEYWORDS) {
-    if (keywords.some((keyword) => normalizedFallback.includes(keyword))) {
+    if (
+      keywords.some((keyword) => containsKeyword(normalizedFallback, keyword))
+    ) {
       return type;
     }
   }
@@ -180,7 +205,10 @@ export function canonicalGarmentType(requested: string): GarmentType | null {
 
   for (const [type, synonyms] of REQUESTED_TYPE_SYNONYMS) {
     for (const synonym of synonyms) {
-      if (normalized.includes(synonym) && synonym.length > (best?.length ?? 0)) {
+      if (
+        containsKeyword(normalized, synonym) &&
+        synonym.length > (best?.length ?? 0)
+      ) {
         best = { type, length: synonym.length };
       }
     }

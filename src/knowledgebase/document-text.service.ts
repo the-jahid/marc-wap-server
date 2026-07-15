@@ -189,9 +189,7 @@ export class DocumentTextService {
 
     for (const attempt of attempts) {
       try {
-        const normalized = this.normalizeExtractedText(
-          await attempt.extract(),
-        );
+        const normalized = this.normalizeExtractedText(await attempt.extract());
 
         if (normalized) {
           return normalized;
@@ -227,7 +225,9 @@ export class DocumentTextService {
     fileType: SupportedFileType | null,
   ): boolean {
     return (
-      fileType === 'pdf' || mimeType.includes('pdf') || fileName.endsWith('.pdf')
+      fileType === 'pdf' ||
+      mimeType.includes('pdf') ||
+      fileName.endsWith('.pdf')
     );
   }
 
