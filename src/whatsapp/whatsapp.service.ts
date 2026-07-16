@@ -1042,7 +1042,6 @@ export class WhatsappService {
         userId,
         userText,
         assistantText,
-        MAX_CONVERSATION_MESSAGES,
         needsHumanAttention,
         attentionReason,
       );

@@ -588,7 +588,7 @@ describe('WhatsappService', () => {
     expect(history[29]?.content).toBe('message 30');
   });
 
-  it('saves user and AI replies and trims stored history to 15 turns', async () => {
+  it('saves user and AI replies without trimming stored history', async () => {
     const saveTurn = jest.fn().mockResolvedValue(undefined);
     const service = new WhatsappService(configService, {
       saveTurn,
@@ -611,7 +611,6 @@ describe('WhatsappService', () => {
       '15551234567',
       'Hi',
       'Hello from AI',
-      30,
       false,
       null,
     );

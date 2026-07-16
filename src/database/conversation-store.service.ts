@@ -35,7 +35,6 @@ export type ConversationStore = {
     phoneNumber: string,
     userText: string,
     assistantText: string,
-    maxMessages: number,
     needsHumanAttention?: boolean,
     attentionReason?: string | null,
   ): Promise<void>;
@@ -178,7 +177,6 @@ export class ConversationStoreService
     phoneNumber: string,
     userText: string,
     assistantText: string,
-    maxMessages: number,
     needsHumanAttention = false,
     attentionReason: string | null = null,
   ): Promise<void> {
@@ -208,19 +206,6 @@ export class ConversationStoreService
           needsHumanAttention,
           needsHumanAttention ? attentionReason : null,
         ],
-      );
-      await client.query(
-        `
-          DELETE FROM "ConversationMessage"
-          WHERE id IN (
-            SELECT id
-            FROM "ConversationMessage"
-            WHERE "phoneNumber" = $1
-            ORDER BY id DESC
-            OFFSET $2
-          )
-        `,
-        [phoneNumber, maxMessages],
       );
       await client.query('COMMIT');
     } catch (error) {
