@@ -1,6 +1,8 @@
 import { ConfigService } from '@nestjs/config';
 import { WhatsappService } from './whatsapp.service';
 import type { WhatsappWebhookPayload } from './whatsapp.types';
+import type { ShopifyService } from '../shopify/shopify.service';
+import type { CustomerOrder } from '../shopify/shopify.types';
 
 describe('WhatsappService', () => {
   const config = {
@@ -16,6 +18,235 @@ describe('WhatsappService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+  });
+
+  describe('order lookup tool', () => {
+    type ToolRunner = {
+      runShopifyTool: (
+        name: string,
+        args: Record<string, unknown>,
+        phone: string,
+      ) => Promise<string>;
+    };
+
+    const withOrders = (orders: CustomerOrder[] = []) => {
+      const findOrders = jest.fn((): Promise<CustomerOrder[]> =>
+        Promise.resolve(orders),
+      );
+      const findOrdersForPhone = jest.fn((): Promise<CustomerOrder[]> =>
+        Promise.resolve([]),
+      );
+      const shopify = {
+        isConfigured: () => true,
+        canSearchProducts: () => false,
+        findOrders,
+        findOrdersForPhone,
+      } as unknown as ShopifyService;
+      const service = new WhatsappService(
+        configService,
+        undefined,
+        undefined,
+        undefined,
+        shopify,
+      );
+
+      return {
+        findOrders,
+        findOrdersForPhone,
+        run: (args: Record<string, unknown>, phone = '34699888777') =>
+          (service as unknown as ToolRunner).runShopifyTool(
+            'lookup_orders',
+            args,
+            phone,
+          ),
+      };
+    };
+
+    it('searches the order number the customer quoted, not only their phone', async () => {
+      const { findOrders, run } = withOrders();
+
+      await run({ orderNumber: '#4054' });
+
+      expect(findOrders).toHaveBeenCalledWith({
+        orderNumber: '#4054',
+        email: null,
+        phone: '34699888777',
+        customerName: null,
+        trackingNumber: null,
+      });
+    });
+
+    // A number the model read out of the chat is searched in addition to the
+    // verified sender, never instead of it.
+    it('keeps searching the verified phone when the model supplies another one', async () => {
+      const { findOrders, findOrdersForPhone, run } = withOrders();
+
+      await run({ phone: '34600111222' });
+
+      expect(findOrders).toHaveBeenCalledWith(
+        expect.objectContaining({ phone: '34600111222' }),
+      );
+      expect(findOrdersForPhone).toHaveBeenCalledWith('34699888777');
+    });
+
+    it('drops blank identifiers rather than searching on them', async () => {
+      const { findOrders, run } = withOrders();
+
+      await run({ orderNumber: '  ', email: '', customerName: 42 });
+
+      expect(findOrders).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderNumber: null,
+          email: null,
+          customerName: null,
+        }),
+      );
+    });
+
+    // The regression itself: a phone-only miss used to end the conversation.
+    it('asks for an identifier instead of escalating when the phone alone finds nothing', async () => {
+      const { run } = withOrders();
+
+      const result = await run({});
+
+      expect(result).toContain('NO_ORDERS_FOUND_BY_PHONE');
+      expect(result).toMatch(/do not hand this to a human yet/i);
+      expect(result).toMatch(/asking them for their order number/i);
+    });
+
+    it('allows a handoff once the identifiers the customer gave still find nothing', async () => {
+      const { run } = withOrders();
+
+      const result = await run({ orderNumber: '4054' });
+
+      expect(result).toContain('NO_ORDERS_FOUND');
+      expect(result).not.toContain('NO_ORDERS_FOUND_BY_PHONE');
+      expect(result).toMatch(/flag the conversation for a human/i);
+    });
+
+    /**
+     * The model routinely needs a second lookup: its first call finds nothing
+     * under the sender's number, and only then does it retry with the order
+     * number. A single-pass grounding leaves it answering "let me look that
+     * up" with no results, so the rounds must actually chain.
+     */
+    it('runs a follow-up tool call so a phone miss can be retried by order number', async () => {
+      const order: CustomerOrder = {
+        name: '#4054',
+        createdAt: '2026-07-01T10:00:00.000Z',
+        fulfillmentStatus: 'IN_TRANSIT',
+        financialStatus: 'PAID',
+        total: '59.90 EUR',
+        items: [{ title: 'SUJETADOR HAVANNA', quantity: 1 }],
+        tracking: [],
+      };
+      const shopify = {
+        isConfigured: () => true,
+        canSearchProducts: () => false,
+        findOrdersForPhone: () => Promise.resolve([]),
+        findOrders: ({ orderNumber }: { orderNumber?: string | null }) =>
+          Promise.resolve(orderNumber === '4054' ? [order] : []),
+      } as unknown as ShopifyService;
+      const service = new WhatsappService(
+        configService,
+        undefined,
+        undefined,
+        undefined,
+        shopify,
+      );
+
+      const toolCall = (id: string, args: Record<string, unknown>) => ({
+        id,
+        name: 'lookup_orders',
+        args,
+      });
+      // Round 1: search the sender's number. Round 2: retry with the number
+      // the customer quoted. Round 3: satisfied, no more calls.
+      const rounds = [
+        { tool_calls: [toolCall('a', {})] },
+        { tool_calls: [toolCall('b', { orderNumber: '4054' })] },
+        { tool_calls: [] },
+      ];
+      let round = 0;
+      const invoke = jest.fn(() => Promise.resolve(rounds[round++]));
+      const chatModel = {
+        bindTools: () => ({ invoke }),
+      } as unknown as Parameters<
+        typeof WhatsappService.prototype['groundInShopify']
+      >[0];
+
+      const grounded = await (
+        service as unknown as {
+          groundInShopify: (
+            model: unknown,
+            messages: unknown[],
+            phone: string,
+          ) => Promise<{ content: unknown }[]>;
+        }
+      ).groundInShopify(chatModel, [], '34699888777');
+
+      expect(invoke).toHaveBeenCalledTimes(3);
+      expect(
+        grounded.map((message) => String(message.content)).join('\n'),
+      ).toContain('Order #4054');
+    });
+
+    it('stops calling tools after the round limit instead of looping forever', async () => {
+      const shopify = {
+        isConfigured: () => true,
+        canSearchProducts: () => false,
+        findOrdersForPhone: () => Promise.resolve([]),
+        findOrders: () => Promise.resolve([]),
+      } as unknown as ShopifyService;
+      const service = new WhatsappService(
+        configService,
+        undefined,
+        undefined,
+        undefined,
+        shopify,
+      );
+
+      // A model that never stops asking for another lookup.
+      const invoke = jest.fn(() =>
+        Promise.resolve({
+          tool_calls: [{ id: 'x', name: 'lookup_orders', args: {} }],
+        }),
+      );
+      const chatModel = { bindTools: () => ({ invoke }) };
+
+      await (
+        service as unknown as {
+          groundInShopify: (
+            model: unknown,
+            messages: unknown[],
+            phone: string,
+          ) => Promise<unknown[]>;
+        }
+      ).groundInShopify(chatModel, [], '34699888777');
+
+      expect(invoke).toHaveBeenCalledTimes(3);
+    });
+
+    it('reports the order it found', async () => {
+      const { run } = withOrders([
+        {
+          name: '#4054',
+          createdAt: '2026-07-01T10:00:00.000Z',
+          fulfillmentStatus: 'FULFILLED',
+          financialStatus: 'PAID',
+          total: '59.90 EUR',
+          items: [{ title: 'SUJETADOR HAVANNA', quantity: 1 }],
+          tracking: [{ number: 'ES12345678', company: 'SEUR', url: null }],
+        },
+      ]);
+
+      const result = await run({ orderNumber: '4054' });
+
+      expect(result).toContain('Order #4054');
+      expect(result).toContain('fulfillment: FULFILLED');
+      expect(result).toContain('SEUR ES12345678');
+      expect(result).not.toContain('NO_ORDERS_FOUND');
+    });
   });
 
   it('validates Meta webhook challenges with the configured token', () => {
@@ -51,9 +282,10 @@ describe('WhatsappService', () => {
 
   it('converts Markdown formatting to WhatsApp-native formatting before sending', async () => {
     const service = new WhatsappService(configService);
-    const fetchMock = jest
-      .spyOn(global, 'fetch')
-      .mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(''),
+    } as Response);
 
     const aiReply = [
       'Sí, tenemos el **sujetador Deauville** en catálogo. Es un **sujetador reductor con aros**.',
@@ -90,9 +322,10 @@ describe('WhatsappService', () => {
 
   it('strips stray formatting symbols so the customer never sees them', async () => {
     const service = new WhatsappService(configService);
-    const fetchMock = jest
-      .spyOn(global, 'fetch')
-      .mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(''),
+    } as Response);
 
     await service.sendManualText(
       '15551234567',
@@ -115,9 +348,10 @@ describe('WhatsappService', () => {
 
   it('leaves URLs untouched when cleaning formatting', async () => {
     const service = new WhatsappService(configService);
-    const fetchMock = jest
-      .spyOn(global, 'fetch')
-      .mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(''),
+    } as Response);
 
     await service.sendManualText(
       '15551234567',

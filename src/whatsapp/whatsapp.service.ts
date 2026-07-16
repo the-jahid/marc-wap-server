@@ -37,12 +37,19 @@ import { KnowledgebaseService } from '../knowledgebase/knowledgebase.service';
 import { ShopifyService } from '../shopify/shopify.service';
 import type {
   CustomerOrder,
+  OrderIdentifiers,
   ProductSearchResult,
 } from '../shopify/shopify.types';
 import { createBraSizeReply } from './bra-size-calculator';
 
 const MAX_CONVERSATION_TURNS = 15;
 const MAX_CONVERSATION_MESSAGES = MAX_CONVERSATION_TURNS * 2;
+/**
+ * Enough for the lookups that genuinely chain — search by the sender's number,
+ * then by the order number they quoted — while still bounding a model that
+ * loops on a tool that keeps returning nothing.
+ */
+const MAX_TOOL_ROUNDS = 3;
 const MAX_TRANSCRIPTION_AUDIO_BYTES = 25 * 1024 * 1024;
 const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-transcribe';
 const CONVERSATION_ROLE = {
@@ -98,27 +105,60 @@ const ADVISOR_REPLY_SCHEMA = {
   additionalProperties: false,
 } as const;
 
-const ORDER_LOOKUP_TOOL_NAME = 'lookup_my_orders';
+const ORDER_LOOKUP_TOOL_NAME = 'lookup_orders';
 
 /**
- * Deliberately takes no parameters. The customer is identified by the phone
- * number WhatsApp reported for the sender, which Meta has verified. If the
- * model could pass an identifier instead, anyone could ask for "the order for
- * +34..." and read a stranger's name, address and purchase history.
+ * The sender's verified WhatsApp number is always searched, and the model may
+ * add any identifier the customer volunteered. Identifiers are OR-ed, so a
+ * customer who quotes an order number is found even when they are messaging
+ * from a number the order was never placed with — the case that used to dead-end
+ * in a human handoff.
+ *
+ * The shop accepts the tradeoff this creates: order numbers are sequential, so
+ * anyone who guesses one can read that order. Do not "fix" that here by
+ * requiring a second identifier without asking the shop first.
  */
 const ORDER_LOOKUP_TOOL = {
   type: 'function' as const,
   function: {
     name: ORDER_LOOKUP_TOOL_NAME,
     description:
-      'Look up the orders belonging to the customer who is messaging right now. ' +
-      'Call this whenever they ask about an order, a delivery, shipping, tracking, a return or a refund. ' +
-      'It takes no arguments: the customer is identified automatically by their verified WhatsApp number. ' +
-      'Never ask the customer for an order number, email address or phone number in order to look up an order, ' +
-      'and never report an order that this tool did not return.',
+      'Look up a customer order. Call this whenever the customer asks about an order, a delivery, ' +
+      'shipping, tracking, a return or a refund. ' +
+      'The customer’s own WhatsApp number is always searched automatically, so call this with no ' +
+      'arguments first. If that finds nothing, pass whatever identifier the customer gives you: an ' +
+      'order number, an email address, another phone number, the full name on the order, or a ' +
+      'tracking number. Any single one of them is enough to find the order. ' +
+      'Only pass values the customer actually stated — never guess an identifier. ' +
+      'Never report an order that this tool did not return.',
     parameters: {
       type: 'object',
-      properties: {},
+      properties: {
+        orderNumber: {
+          type: 'string',
+          description:
+            'The order number as the customer wrote it, e.g. "4054" or "#4054".',
+        },
+        email: {
+          type: 'string',
+          description:
+            'The email address the customer says the order was placed with.',
+        },
+        phone: {
+          type: 'string',
+          description:
+            'Another phone number the customer says the order was placed with. Do not pass the number they are messaging from; that is searched already.',
+        },
+        customerName: {
+          type: 'string',
+          description:
+            'The full name on the order (first and last). Do not pass a first name on its own.',
+        },
+        trackingNumber: {
+          type: 'string',
+          description: 'A shipment tracking number the customer quotes.',
+        },
+      },
       required: [],
       additionalProperties: false,
     },
@@ -126,10 +166,17 @@ const ORDER_LOOKUP_TOOL = {
 };
 
 const ORDER_LOOKUP_SYSTEM_PROMPT =
-  `\n\nYou can look up this customer's own orders with the ${ORDER_LOOKUP_TOOL_NAME} tool. ` +
-  'They are identified by the WhatsApp number they are messaging from, so you never need to ask them who they are. ' +
-  'Only ever discuss orders that the tool returned; if it returns none, say you cannot find an order under their number ' +
-  'and hand the conversation to a human rather than guessing.';
+  `\n\nYou can look up orders with the ${ORDER_LOOKUP_TOOL_NAME} tool. ` +
+  'The customer’s WhatsApp number is always searched automatically, so pass only the identifiers ' +
+  'they actually gave you: an order number, email, another phone number, the full name on the ' +
+  'order, or a tracking number. Any one of them finds the order on its own. If they have given ' +
+  'none yet, call the tool with no arguments. ' +
+  'If a lookup finds nothing, do NOT hand the conversation to a human: many customers order with ' +
+  'a different phone number than the one they message from. Ask them for their order number and ' +
+  'look it up when they reply. ' +
+  'Only discuss orders the tool actually returned, and never invent one. ' +
+  'Hand over to a human once a lookup with the identifiers they gave still finds nothing, or if ' +
+  'they are upset, ask for a person, or have a real problem with their order.';
 
 const PRODUCT_SEARCH_TOOL_NAME = 'search_products';
 
@@ -380,6 +427,12 @@ export class WhatsappService {
    * Lets the model pull real orders and real catalogue data before it answers,
    * so the reply is grounded in Shopify rather than in whatever the model would
    * otherwise invent about a price, a size or a delivery.
+   *
+   * Tool calls run in a loop, not a single pass: one lookup routinely informs
+   * the next. An order search by the customer's own number that finds nothing
+   * has to be retried with the order number they quoted, and the model can only
+   * do that if it gets another turn with the tools still bound. Without the
+   * loop it answers "let me look that up" and never does.
    */
   private async groundInShopify(
     chatModel: ChatOpenAI,
@@ -395,39 +448,53 @@ export class WhatsappService {
       return messages;
     }
 
-    try {
-      const response = await chatModel.bindTools(tools).invoke(messages);
-      const toolCalls = response.tool_calls ?? [];
+    const modelWithTools = chatModel.bindTools(tools);
+    let grounded = messages;
 
-      if (toolCalls.length === 0) {
-        return messages;
+    try {
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+        const response = await modelWithTools.invoke(grounded);
+        const toolCalls = response.tool_calls ?? [];
+
+        // The model has everything it needs; let it write the reply.
+        if (toolCalls.length === 0) {
+          return grounded;
+        }
+
+        const results = await Promise.all(
+          toolCalls.map((toolCall) =>
+            this.runShopifyTool(toolCall.name, toolCall.args, customerPhone),
+          ),
+        );
+
+        grounded = [
+          ...grounded,
+          response,
+          ...toolCalls.map(
+            (toolCall, index) =>
+              new ToolMessage({
+                tool_call_id: toolCall.id ?? '',
+                name: toolCall.name,
+                content: results[index],
+              }),
+          ),
+        ];
       }
 
-      const results = await Promise.all(
-        toolCalls.map((toolCall) =>
-          this.runShopifyTool(toolCall.name, toolCall.args, customerPhone),
-        ),
+      this.logger.warn(
+        `Order/product grounding hit the ${MAX_TOOL_ROUNDS}-round tool limit; ` +
+          'answering with what has been gathered so far',
       );
 
-      return [
-        ...messages,
-        response,
-        ...toolCalls.map(
-          (toolCall, index) =>
-            new ToolMessage({
-              tool_call_id: toolCall.id ?? '',
-              name: toolCall.name,
-              content: results[index],
-            }),
-        ),
-      ];
+      return grounded;
     } catch (error) {
       this.logger.warn(
         'Shopify lookup failed; replying without shop data',
         error instanceof Error ? error.stack : String(error),
       );
 
-      return messages;
+      // Partial tool results are still better grounding than none.
+      return grounded;
     }
   }
 
@@ -440,16 +507,24 @@ export class WhatsappService {
       name === ORDER_LOOKUP_TOOL_NAME &&
       this.canLookUpOrders(customerPhone)
     ) {
-      // The phone comes from the webhook, never from `args`: the model has no
-      // say in whose orders get read.
-      const orders =
-        await this.shopifyService!.findOrdersForPhone(customerPhone);
+      const supplied = this.readOrderIdentifiers(args);
+      // The sender's verified number is always searched. A phone the model
+      // supplies is searched as well as, never instead of, that number.
+      const orders = await this.shopifyService!.findOrders({
+        ...supplied,
+        phone: supplied.phone ?? customerPhone,
+      });
+      const extraOrders = supplied.phone
+        ? await this.shopifyService!.findOrdersForPhone(customerPhone)
+        : [];
+      const merged = this.mergeOrders(orders, extraOrders);
 
       this.logger.log(
-        `Order lookup for ${this.maskPhone(customerPhone)} matched ${orders.length} order(s)`,
+        `Order lookup for ${this.maskPhone(customerPhone)} ` +
+          `[${this.describeIdentifiers(supplied)}] matched ${merged.length} order(s)`,
       );
 
-      return this.describeOrders(orders);
+      return this.describeOrders(merged, supplied);
     }
 
     if (name === PRODUCT_SEARCH_TOOL_NAME && this.canSearchProducts()) {
@@ -499,13 +574,74 @@ export class WhatsappService {
     ].join('\n\n');
   }
 
-  private describeOrders(orders: CustomerOrder[]): string {
+  /**
+   * Reads the identifiers the model passed, keeping only non-empty strings.
+   * A blank or non-string argument is dropped rather than searched: an empty
+   * identifier matches nothing, but an empty *set* of identifiers would make
+   * the lookup fall back to a bare recent-orders scan.
+   */
+  private readOrderIdentifiers(
+    args: Record<string, unknown>,
+  ): OrderIdentifiers {
+    const read = (key: string): string | null => {
+      const value = args[key];
+
+      return typeof value === 'string' && value.trim() ? value.trim() : null;
+    };
+
+    return {
+      orderNumber: read('orderNumber'),
+      email: read('email'),
+      phone: read('phone'),
+      customerName: read('customerName'),
+      trackingNumber: read('trackingNumber'),
+    };
+  }
+
+  private mergeOrders(...groups: CustomerOrder[][]): CustomerOrder[] {
+    const byName = new Map<string, CustomerOrder>();
+
+    for (const order of groups.flat()) {
+      byName.set(order.name, order);
+    }
+
+    return [...byName.values()];
+  }
+
+  private describeIdentifiers(identifiers: OrderIdentifiers): string {
+    const supplied = Object.entries(identifiers)
+      .filter(([, value]) => value)
+      .map(([key]) => key);
+
+    return supplied.length ? supplied.join(', ') : 'verified phone only';
+  }
+
+  private describeOrders(
+    orders: CustomerOrder[],
+    supplied: OrderIdentifiers = {},
+  ): string {
     if (orders.length === 0) {
+      const askedWith = Object.values(supplied).some(Boolean);
+
+      // The customer gave us nothing but their number yet: the order is very
+      // often placed under a different one, so ask before escalating.
+      if (!askedWith) {
+        return (
+          'NO_ORDERS_FOUND_BY_PHONE. No order is registered to the number this customer ' +
+          'is messaging from — but that is common and does NOT mean they have no order. ' +
+          'Do not hand this to a human yet, and do not tell them their order does not exist. ' +
+          'If they have already mentioned an order number, email, phone number, full name or ' +
+          `tracking number anywhere in this conversation, call ${ORDER_LOOKUP_TOOL_NAME} again ` +
+          'now, passing that value. If they have not, reply asking them for their order number ' +
+          '(or email, phone, full name or tracking number) and wait for their answer.'
+        );
+      }
+
       return (
-        'NO_ORDERS_FOUND. No order in the shop is registered to this customer’s ' +
-        'WhatsApp number. Do not invent an order and do not ask them for an order ' +
-        'number to look one up. Tell them you cannot find an order under their ' +
-        'number, and flag the conversation for a human colleague to check.'
+        'NO_ORDERS_FOUND. Nothing matched the identifiers the customer gave. Do not invent ' +
+        'an order. If they have not tried another identifier yet, ask for one (order number, ' +
+        'email, phone, full name or tracking number). If they have, tell them you cannot ' +
+        'locate the order and flag the conversation for a human colleague to check.'
       );
     }
 

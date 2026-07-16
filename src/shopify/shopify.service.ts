@@ -15,11 +15,18 @@ import type {
   AbandonedCheckout,
   AbandonedCheckoutsPage,
   CustomerOrder,
+  OrderIdentifiers,
+  OrderNode,
   OrdersPage,
   ProductMatch,
   ProductSearchResult,
   ProductSearchPage,
 } from './shopify.types';
+
+/** `OrderIdentifiers` after normalization: every value is a comparison key or null. */
+type NormalizedIdentifiers = {
+  [K in keyof Required<OrderIdentifiers>]: string | null;
+};
 
 const DEFAULT_API_VERSION = '2025-01';
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -67,28 +74,48 @@ const PRODUCT_SEARCH_QUERY = `
   }
 `;
 
+const ORDER_FIELDS_FRAGMENT = `
+  fragment OrderFields on Order {
+    name
+    createdAt
+    email
+    phone
+    displayFulfillmentStatus
+    displayFinancialStatus
+    totalPriceSet { shopMoney { amount currencyCode } }
+    customer { firstName lastName displayName email phone }
+    shippingAddress { name phone }
+    billingAddress { name phone }
+    lineItems(first: 10) {
+      edges { node { title quantity } }
+    }
+    fulfillments(first: 5) {
+      trackingInfo { number company url }
+    }
+  }
+`;
+
 const ORDERS_QUERY = `
+  ${ORDER_FIELDS_FRAGMENT}
   query RecentOrders($first: Int!, $after: String) {
     orders(first: $first, after: $after, reverse: true) {
       pageInfo { hasNextPage endCursor }
-      edges {
-        node {
-          name
-          createdAt
-          phone
-          displayFulfillmentStatus
-          displayFinancialStatus
-          totalPriceSet { shopMoney { amount currencyCode } }
-          customer { phone }
-          shippingAddress { phone }
-          lineItems(first: 10) {
-            edges { node { title quantity } }
-          }
-          fulfillments(first: 5) {
-            trackingInfo { number company url }
-          }
-        }
-      }
+      edges { node { ...OrderFields } }
+    }
+  }
+`;
+
+/**
+ * The same fields, narrowed by Shopify's own order search. Used only for the
+ * keys Shopify genuinely indexes (`name:`, `email:`), and never trusted on its
+ * own — see `searchOrders`.
+ */
+const ORDERS_SEARCH_QUERY = `
+  ${ORDER_FIELDS_FRAGMENT}
+  query SearchOrders($first: Int!, $after: String, $query: String!) {
+    orders(first: $first, after: $after, reverse: true, query: $query) {
+      pageInfo { hasNextPage endCursor }
+      edges { node { ...OrderFields } }
     }
   }
 `;
@@ -476,19 +503,77 @@ export class ShopifyService {
     return payload.data;
   }
 
-  /**
-   * Orders belonging to `customerPhone`, newest first.
-   *
-   * The caller must pass the phone number WhatsApp reported as the sender.
-   * Never pass a number the customer typed, or one a language model produced
-   * from the message text: either would let anyone read a stranger's orders.
-   *
-   * Matching happens here rather than in the Shopify query on purpose.
-   * Shopify's order search silently ignores an unrecognised `phone:` key and
-   * returns the most recent orders in the shop instead of an empty result, so
-   * a server-side filter would hand the wrong customer's order to whoever asked.
-   */
+  /** Orders belonging to `customerPhone`, newest first. */
   async findOrdersForPhone(customerPhone: string): Promise<CustomerOrder[]> {
+    return this.findOrders({ phone: customerPhone });
+  }
+
+  /**
+   * Orders matching ANY of the supplied identifiers, newest first.
+   *
+   * Identifiers are OR-ed: an order number alone is enough, as is an email, a
+   * phone, a full name or a tracking number. A customer who quotes "#4054"
+   * therefore gets their order without ever having to message from the number
+   * they ordered with.
+   *
+   * Order numbers are sequential, so this deliberately trades confidentiality
+   * for reachability: anyone who can guess an order number can read that
+   * order. That is the shop's accepted policy, not an oversight — see
+   * `describeOrders` in WhatsappService for the matching agent instructions.
+   *
+   * Whatever narrowed the search, the final match is always decided locally by
+   * `matchesIdentifiers`. Shopify's order search silently ignores an
+   * unrecognised key (such as `phone:`) and answers with the shop's most recent
+   * orders instead of an empty result, so trusting it would hand a stranger's
+   * order to whoever asked.
+   */
+  async findOrders(identifiers: OrderIdentifiers): Promise<CustomerOrder[]> {
+    const wanted = this.normalizeIdentifiers(identifiers);
+
+    if (!wanted) {
+      return [];
+    }
+
+    // `name:` and `email:` are really indexed by Shopify, so they find orders
+    // of any age. Everything else has to be matched by scanning.
+    const searched = await this.searchOrders(wanted);
+
+    if (searched.length > 0) {
+      return searched;
+    }
+
+    return this.scanOrders(wanted);
+  }
+
+  private async searchOrders(
+    wanted: NormalizedIdentifiers,
+  ): Promise<CustomerOrder[]> {
+    const terms = [
+      wanted.orderNumber
+        ? `name:${this.quoteSearchTerm(wanted.orderNumber)}`
+        : null,
+      wanted.email ? `email:${this.quoteSearchTerm(wanted.email)}` : null,
+    ].filter((term): term is string => term !== null);
+
+    if (terms.length === 0) {
+      return [];
+    }
+
+    const page = await this.adminGraphql<OrdersPage>(ORDERS_SEARCH_QUERY, {
+      first: ORDERS_PER_PAGE,
+      after: null,
+      query: terms.join(' OR '),
+    });
+
+    return this.collectMatches(
+      page.orders.edges.map(({ node }) => node),
+      wanted,
+    );
+  }
+
+  private async scanOrders(
+    wanted: NormalizedIdentifiers,
+  ): Promise<CustomerOrder[]> {
     const matches: CustomerOrder[] = [];
     let cursor: string | undefined;
     let scanned = 0;
@@ -499,40 +584,16 @@ export class ShopifyService {
         after: cursor ?? null,
       });
 
-      for (const { node } of page.orders.edges) {
-        scanned += 1;
+      scanned += page.orders.edges.length;
+      matches.push(
+        ...this.collectMatches(
+          page.orders.edges.map(({ node }) => node),
+          wanted,
+        ),
+      );
 
-        const belongsToCustomer =
-          phonesMatch(customerPhone, node.shippingAddress?.phone) ||
-          phonesMatch(customerPhone, node.phone) ||
-          phonesMatch(customerPhone, node.customer?.phone);
-
-        if (!belongsToCustomer) {
-          continue;
-        }
-
-        matches.push({
-          name: node.name,
-          createdAt: node.createdAt,
-          fulfillmentStatus: node.displayFulfillmentStatus,
-          financialStatus: node.displayFinancialStatus,
-          total: `${node.totalPriceSet.shopMoney.amount} ${node.totalPriceSet.shopMoney.currencyCode}`,
-          items: node.lineItems.edges.map(({ node: item }) => ({
-            title: item.title,
-            quantity: item.quantity,
-          })),
-          tracking: node.fulfillments.flatMap((fulfillment) =>
-            fulfillment.trackingInfo.map((info) => ({
-              number: info.number ?? null,
-              company: info.company ?? null,
-              url: info.url ?? null,
-            })),
-          ),
-        });
-
-        if (matches.length >= MAX_ORDERS_RETURNED) {
-          return matches;
-        }
+      if (matches.length >= MAX_ORDERS_RETURNED) {
+        return matches.slice(0, MAX_ORDERS_RETURNED);
       }
 
       if (!page.orders.pageInfo.hasNextPage) {
@@ -543,6 +604,142 @@ export class ShopifyService {
     }
 
     return matches;
+  }
+
+  private collectMatches(
+    nodes: OrderNode[],
+    wanted: NormalizedIdentifiers,
+  ): CustomerOrder[] {
+    return nodes
+      .filter((node) => this.matchesIdentifiers(node, wanted))
+      .slice(0, MAX_ORDERS_RETURNED)
+      .map((node) => this.toCustomerOrder(node));
+  }
+
+  /**
+   * True when the order answers at least one identifier the customer gave.
+   * Every comparison is exact once normalized: a partial or fuzzy match here
+   * would return a different customer's order.
+   */
+  private matchesIdentifiers(
+    node: OrderNode,
+    wanted: NormalizedIdentifiers,
+  ): boolean {
+    if (
+      wanted.orderNumber &&
+      this.orderNumberKey(node.name) === wanted.orderNumber
+    ) {
+      return true;
+    }
+
+    if (
+      wanted.email &&
+      [node.email, node.customer?.email].some(
+        (email) => this.emailKey(email) === wanted.email,
+      )
+    ) {
+      return true;
+    }
+
+    if (
+      wanted.phone &&
+      [
+        node.phone,
+        node.customer?.phone,
+        node.shippingAddress?.phone,
+        node.billingAddress?.phone,
+      ].some((phone) => phonesMatch(wanted.phone, phone))
+    ) {
+      return true;
+    }
+
+    if (
+      wanted.customerName &&
+      [
+        node.customer?.displayName,
+        [node.customer?.firstName, node.customer?.lastName]
+          .filter(Boolean)
+          .join(' '),
+        node.shippingAddress?.name,
+        node.billingAddress?.name,
+      ].some((name) => this.nameKey(name) === wanted.customerName)
+    ) {
+      return true;
+    }
+
+    if (
+      wanted.trackingNumber &&
+      node.fulfillments.some((fulfillment) =>
+        fulfillment.trackingInfo.some(
+          (info) => this.trackingKey(info.number) === wanted.trackingNumber,
+        ),
+      )
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private normalizeIdentifiers(
+    identifiers: OrderIdentifiers,
+  ): NormalizedIdentifiers | null {
+    const wanted: NormalizedIdentifiers = {
+      orderNumber: this.orderNumberKey(identifiers.orderNumber),
+      email: this.emailKey(identifiers.email),
+      phone: normalizePhone(identifiers.phone),
+      customerName: this.nameKey(identifiers.customerName),
+      trackingNumber: this.trackingKey(identifiers.trackingNumber),
+    };
+
+    return Object.values(wanted).some((value) => value !== null)
+      ? wanted
+      : null;
+  }
+
+  /**
+   * Order names carry punctuation and per-shop prefixes ("#4054", "MARC-4054")
+   * that a customer never types, so orders are keyed on their digits: "4054",
+   * "#4054" and "no. 4054" all resolve to the same order.
+   */
+  private orderNumberKey(raw: string | null | undefined): string | null {
+    const digits = raw?.replace(/\D/g, '') ?? '';
+
+    return digits || null;
+  }
+
+  private emailKey(raw: string | null | undefined): string | null {
+    return raw?.trim().toLowerCase() || null;
+  }
+
+  /** Accent- and spacing-insensitive: "MARÍA GARCÍA" keys the same as "maria garcia". */
+  private nameKey(raw: string | null | undefined): string | null {
+    return raw ? this.normalizeSearchText(raw) || null : null;
+  }
+
+  private trackingKey(raw: string | null | undefined): string | null {
+    return raw?.replace(/[^\p{L}\p{N}]+/gu, '').toUpperCase() || null;
+  }
+
+  private toCustomerOrder(node: OrderNode): CustomerOrder {
+    return {
+      name: node.name,
+      createdAt: node.createdAt,
+      fulfillmentStatus: node.displayFulfillmentStatus,
+      financialStatus: node.displayFinancialStatus,
+      total: `${node.totalPriceSet.shopMoney.amount} ${node.totalPriceSet.shopMoney.currencyCode}`,
+      items: node.lineItems.edges.map(({ node: item }) => ({
+        title: item.title,
+        quantity: item.quantity,
+      })),
+      tracking: node.fulfillments.flatMap((fulfillment) =>
+        fulfillment.trackingInfo.map((info) => ({
+          number: info.number ?? null,
+          company: info.company ?? null,
+          url: info.url ?? null,
+        })),
+      ),
+    };
   }
 
   /**

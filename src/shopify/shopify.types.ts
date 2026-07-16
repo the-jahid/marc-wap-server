@@ -19,6 +19,24 @@ export type CustomerOrder = {
   tracking: OrderTracking[];
 };
 
+/**
+ * Everything a customer can be asked for to find their order. Any one of these
+ * is enough on its own; they are matched with OR, not AND.
+ *
+ * `phone` carries a trust distinction the matcher does not see: the caller may
+ * pass the number WhatsApp verified for the sender, or one the customer typed
+ * into the chat. Both find the same orders.
+ */
+export type OrderIdentifiers = {
+  /** As the customer says it: "4054", "#4054", "no. 4054". */
+  orderNumber?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  /** The full name on the order, not a first name alone. */
+  customerName?: string | null;
+  trackingNumber?: string | null;
+};
+
 import type { GarmentType } from './products';
 
 export type ProductMatch = {
@@ -115,22 +133,30 @@ export type ProductSearchPage = {
   };
 };
 
+export type OrderNode = {
+  name: string;
+  createdAt: string;
+  email: string | null;
+  phone: string | null;
+  displayFulfillmentStatus: string;
+  displayFinancialStatus: string;
+  totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+  customer: {
+    firstName: string | null;
+    lastName: string | null;
+    displayName: string | null;
+    email: string | null;
+    phone: string | null;
+  } | null;
+  shippingAddress: { name: string | null; phone: string | null } | null;
+  billingAddress: { name: string | null; phone: string | null } | null;
+  lineItems: { edges: { node: { title: string; quantity: number } }[] };
+  fulfillments: { trackingInfo: Partial<OrderTracking>[] }[];
+};
+
 export type OrdersPage = {
   orders: {
     pageInfo: { hasNextPage: boolean; endCursor: string };
-    edges: {
-      node: {
-        name: string;
-        createdAt: string;
-        phone: string | null;
-        displayFulfillmentStatus: string;
-        displayFinancialStatus: string;
-        totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
-        customer: { phone: string | null } | null;
-        shippingAddress: { phone: string | null } | null;
-        lineItems: { edges: { node: { title: string; quantity: number } }[] };
-        fulfillments: { trackingInfo: Partial<OrderTracking>[] }[];
-      };
-    }[];
+    edges: { node: OrderNode }[];
   };
 };
