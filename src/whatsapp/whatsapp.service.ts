@@ -42,6 +42,8 @@ import type {
 import { createBraSizeReply } from './bra-size-calculator';
 
 const MAX_CONVERSATION_MESSAGES = 15;
+/** Routes every replica's requests at one cached prefix instead of one each. */
+const PROMPT_CACHE_KEY = 'whatsapp-agent';
 /**
  * Enough for the lookups that genuinely chain — search by the sender's number,
  * then by the order number they quoted — while still bounding a model that
@@ -803,6 +805,15 @@ export class WhatsappService {
       model,
       maxRetries: 2,
       useResponsesApi: true,
+      // Every reply repeats the same ~1.5k-token preamble of system prompt and
+      // tool instructions — comfortably over the 1k-token minimum a prefix must
+      // reach to be cached at all — which OpenAI bills at a tenth of the input
+      // rate once cached. The key keeps replicas reading one cache rather than
+      // one each. Retention is pinned rather than left to the org's data
+      // policy, under which a ZDR org would fall back to in-memory and start
+      // almost every conversation cold, customers writing hours apart.
+      promptCacheKey: PROMPT_CACHE_KEY,
+      promptCacheRetention: '24h',
     });
     this.chatModelName = model;
 
