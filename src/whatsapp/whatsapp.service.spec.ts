@@ -584,7 +584,7 @@ describe('WhatsappService', () => {
       text: { body: '83 and 118' },
     });
 
-    expect(reply).toContain('cannot calculate an approximate size safely');
+    expect(reply).toContain('no puedo calcular una talla aproximada de forma segura');
     expect(saveConversationTurn).toHaveBeenCalledWith(
       '15551234567',
       '83 and 118',

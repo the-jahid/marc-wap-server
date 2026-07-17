@@ -41,7 +41,7 @@ const MEASUREMENT_KEYWORD =
   /\b(cm|cms|centimeters?|centimetres?|measurements?|under\s*bust|over\s*bust|band|bust|bra|size|medidas?|cent[i\u00ed]metros?|contorno|bajo pecho|busto|pecho|talla)\b/i;
 
 export const BRA_SIZE_SAFETY_REPLY =
-  'With these measurements, I cannot calculate an approximate size safely. To avoid giving you an incorrect size, I would prefer an expert advisor to review it.';
+  'Con estas medidas no puedo calcular una talla aproximada de forma segura. Para evitar darle una talla incorrecta, prefiero que un asesor experto lo revise.';
 
 export type BraSizeReply = {
   reply: string;
@@ -80,7 +80,7 @@ export function createBraSizeReply(userText: string): BraSizeReply | null {
   const size = `${frEsBand} ${cup} (FR/ES)`;
 
   return {
-    reply: `Thank you. Based on the measurements you provided, your recommended size would be: ${size}.\n\nThis size is an approximate recommendation and may vary depending on the model.`,
+    reply: `Gracias. Según las medidas que nos ha facilitado, su talla recomendada sería: ${size}.\n\nEsta talla es una recomendación aproximada y puede variar según el modelo.`,
     needsHumanAttention: false,
     attentionReason: null,
   };
