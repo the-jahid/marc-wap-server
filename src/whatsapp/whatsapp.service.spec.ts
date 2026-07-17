@@ -594,6 +594,36 @@ describe('WhatsappService', () => {
     );
   });
 
+  it('prints escaped newlines as line breaks instead of a literal backslash-n', () => {
+    const service = new WhatsappService(configService);
+    const format = (
+      service as unknown as { formatForWhatsapp: (text: string) => string }
+    ).formatForWhatsapp.bind(service);
+
+    // A model writing JSON escaped its newlines twice, so the customer was
+    // shown "Perfecto, ya tengo localizado el pedido #4051.\n\n- Estado..."
+    // with the backslashes visible.
+    const formatted = format(
+      'Perfecto, ya tengo localizado el pedido #4051.\\n\\n- Estado: completado\\n- Pago: pagado',
+    );
+
+    expect(formatted).not.toContain('\\n');
+    expect(formatted).toBe(
+      'Perfecto, ya tengo localizado el pedido #4051.\n\n- Estado: completado\n- Pago: pagado',
+    );
+  });
+
+  it('leaves real line breaks and bullet formatting alone', () => {
+    const service = new WhatsappService(configService);
+    const format = (
+      service as unknown as { formatForWhatsapp: (text: string) => string }
+    ).formatForWhatsapp.bind(service);
+
+    expect(format('Clara – 57 EUR\n\n• Negro\n• Beige')).toBe(
+      'Clara – 57 EUR\n\n- Negro\n- Beige',
+    );
+  });
+
   it('does not let an empty catalogue search stand for an unavailable size', () => {
     const service = new WhatsappService(configService);
     const describeProducts = (

@@ -1289,6 +1289,13 @@ export class WhatsappService {
   private normalizeListMarkers(text: string): string {
     return (
       text
+        // A model writing JSON sometimes escapes its newlines twice, so the
+        // reply arrives carrying the two characters \ and n rather than a line
+        // break, and WhatsApp prints them literally. Nothing a customer types
+        // about lingerie contains "\n", so reading it as the newline the model
+        // meant is safe.
+        .replace(/\\r\\n|\\n/g, '\n')
+        .replace(/\\t/g, ' ')
         .replace(/\r\n/g, '\n')
         // Drop zero-width and word-joiner characters that ride along with the
         // fancy bullet glyphs some sources paste in (e.g. "•⁠ ⁠").
