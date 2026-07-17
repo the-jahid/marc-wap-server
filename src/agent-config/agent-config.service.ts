@@ -8,10 +8,13 @@ export const DEFAULT_SYSTEM_PROMPT = [
   'Ask a short follow-up question when you need more details.',
 ].join(' ');
 
-export const DEFAULT_MODEL = 'gpt-5.5';
+export const DEFAULT_MODEL = 'gpt-5.6-luna';
 
 export const DEFAULT_CHAT_MODELS = [
   DEFAULT_MODEL,
+  'gpt-5.6-terra',
+  'gpt-5.6-sol',
+  'gpt-5.5',
   'gpt-5.5-pro',
   'gpt-5.4',
   'gpt-5.4-pro',

@@ -41,7 +41,7 @@ import type {
 } from '../shopify/shopify.types';
 import { createBraSizeReply } from './bra-size-calculator';
 
-const MAX_CONVERSATION_MESSAGES = 5;
+const MAX_CONVERSATION_MESSAGES = 15;
 /**
  * Enough for the lookups that genuinely chain — search by the sender's number,
  * then by the order number they quoted — while still bounding a model that
@@ -794,10 +794,15 @@ export class WhatsappService {
 
     const apiKey = this.getRequiredConfig(['OPENAI_API_KEY']);
 
+    // Reasoning models reject function tools on /v1/chat/completions, so the
+    // whole Shopify grounding pass 400s and the agent answers about sizes and
+    // orders with no shop data at all. /v1/responses takes tools and reasoning
+    // together, and serves the non-reasoning models just as well.
     this.chatModel = new ChatOpenAI({
       apiKey,
       model,
       maxRetries: 2,
+      useResponsesApi: true,
     });
     this.chatModelName = model;
 
