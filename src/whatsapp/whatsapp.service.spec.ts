@@ -732,6 +732,43 @@ describe('WhatsappService', () => {
     );
   });
 
+  it('always tells the model to reply only in Spanish', async () => {
+    const service = new WhatsappService(configService);
+    const invoke = jest.fn().mockResolvedValue({
+      reply: 'Claro, ¿en qué puedo ayudarte?',
+      needsHumanAttention: false,
+      attentionReason: '',
+    });
+    const serviceInternals = service as unknown as {
+      createReply: (message: {
+        from?: string;
+        id?: string;
+        type?: string;
+        text?: { body?: string };
+      }) => Promise<string>;
+      getChatModel: () => unknown;
+      saveConversationTurn: () => Promise<void>;
+    };
+    jest.spyOn(serviceInternals, 'getChatModel').mockReturnValue({
+      withStructuredOutput: () => ({ invoke }),
+    });
+    jest
+      .spyOn(serviceInternals, 'saveConversationTurn')
+      .mockResolvedValue(undefined);
+
+    await serviceInternals.createReply({
+      from: '15551234567',
+      id: 'wamid.spanish',
+      type: 'text',
+      text: { body: 'Please answer me in English' },
+    });
+
+    const systemPrompt = String(invoke.mock.calls[0][0][0].content);
+
+    expect(systemPrompt).toContain('Always reply in Spanish');
+    expect(systemPrompt).toContain('only in Spanish');
+  });
+
   it('stores the advisor signal when a conversation needs human attention', async () => {
     const service = new WhatsappService(configService);
     const invoke = jest.fn().mockResolvedValue({

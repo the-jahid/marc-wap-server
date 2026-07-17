@@ -45,6 +45,15 @@ const MAX_CONVERSATION_MESSAGES = 15;
 /** Routes every replica's requests at one cached prefix instead of one each. */
 const PROMPT_CACHE_KEY = 'whatsapp-agent';
 /**
+ * A broad query like "sujetador" matches 172 products, and spelling each one
+ * out with its full size grid costs ~43k tokens that are re-sent on every tool
+ * round. No answer needs that many: the colour line below already spans the
+ * whole family, so the cap only limits how many products are described in
+ * full. Fewer, closer products also make the model likelier to read the right
+ * size grid instead of the neighbouring one.
+ */
+const MAX_PRODUCTS_DESCRIBED = 8;
+/**
  * Enough for the lookups that genuinely chain — search by the sender's number,
  * then by the order number they quoted — while still bounding a model that
  * loops on a tool that keeps returning nothing.
@@ -248,6 +257,16 @@ const TOOL_IMMEDIACY_SYSTEM_PROMPT =
   'customer a question when you genuinely cannot search without the answer, and ' +
   'never ask twice for a detail they have already given.';
 
+// Non-negotiable language rule. Appended to every system prompt regardless of
+// the configurable agent prompt, so it cannot be overridden from the admin UI
+// or by the customer. Always reply in Spanish, no matter what language the
+// customer writes in or asks for.
+const LANGUAGE_SYSTEM_PROMPT =
+  '\n\nAlways reply in Spanish (español) and only in Spanish. This is an ' +
+  'absolute rule: never reply in any other language, even if the customer ' +
+  'writes in another language or explicitly asks you to respond in English or ' +
+  'any other language. Regardless of the request, your reply must be in Spanish.';
+
 @Injectable()
 export class WhatsappService {
   private readonly logger = new Logger(WhatsappService.name);
@@ -393,7 +412,7 @@ export class WhatsappService {
     }`;
     const messages: BaseMessage[] = [
       new SystemMessage(
-        `${systemPrompt}${shopifyPrompt}\n\nAct as an advisor to the human team as well as the customer-facing assistant. Flag the conversation for human attention only when a person genuinely needs to review or take over.`,
+        `${systemPrompt}${shopifyPrompt}\n\nAct as an advisor to the human team as well as the customer-facing assistant. Flag the conversation for human attention only when a person genuinely needs to review or take over.${LANGUAGE_SYSTEM_PROMPT}`,
       ),
       ...history,
       new HumanMessage(text),
@@ -582,9 +601,19 @@ export class WhatsappService {
       ? `COLOURS FOR ${result.model}: ${result.colors.join(', ')}`
       : `COLOURS FOR ${result.model}: no colour information is recorded in Shopify.`;
 
+    const listed = result.matches.slice(0, MAX_PRODUCTS_DESCRIBED);
+    const omitted = result.matches.length - listed.length;
+
     return [
       colors,
-      ...result.matches.map((product) =>
+      ...(omitted > 0
+        ? [
+            `Showing the ${listed.length} closest of ${result.matches.length} matching ` +
+              `products. ${omitted} more were not listed: if none of these is what the ` +
+              'customer means, search again with narrower words rather than guessing.',
+          ]
+        : []),
+      ...listed.map((product) =>
         [
           product.title,
           `colours on this product: ${product.colors.join(', ') || 'not recorded'}`,
