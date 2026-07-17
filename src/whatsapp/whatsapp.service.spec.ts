@@ -46,7 +46,6 @@ describe('WhatsappService', () => {
         configService,
         undefined,
         undefined,
-        undefined,
         shopify,
       );
 
@@ -151,7 +150,6 @@ describe('WhatsappService', () => {
         configService,
         undefined,
         undefined,
-        undefined,
         shopify,
       );
 
@@ -200,7 +198,6 @@ describe('WhatsappService', () => {
       } as unknown as ShopifyService;
       const service = new WhatsappService(
         configService,
-        undefined,
         undefined,
         undefined,
         shopify,
@@ -790,9 +787,9 @@ describe('WhatsappService', () => {
     });
   });
 
-  it('loads the latest 15 user and AI conversation turns by phone number', async () => {
+  it('loads the latest 5 user and AI conversation messages by phone number', async () => {
     const findLatestMessages = jest.fn().mockResolvedValue(
-      Array.from({ length: 30 }, (_, index) => {
+      Array.from({ length: 5 }, (_, index) => {
         const id = index + 1;
 
         return {
@@ -816,10 +813,10 @@ describe('WhatsappService', () => {
     const history =
       await serviceInternals.getConversationHistory('15551234567');
 
-    expect(findLatestMessages).toHaveBeenCalledWith('15551234567', 30);
-    expect(history).toHaveLength(30);
+    expect(findLatestMessages).toHaveBeenCalledWith('15551234567', 5);
+    expect(history).toHaveLength(5);
     expect(history[0]?.content).toBe('message 1');
-    expect(history[29]?.content).toBe('message 30');
+    expect(history[4]?.content).toBe('message 5');
   });
 
   it('saves user and AI replies without trimming stored history', async () => {

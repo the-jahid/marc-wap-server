@@ -33,7 +33,6 @@ import {
 } from '../agent-config/agent-config.service';
 import { CONVERSATION_STORE } from '../database/conversation-store.constants';
 import type { ConversationStore } from '../database/conversation-store.service';
-import { KnowledgebaseService } from '../knowledgebase/knowledgebase.service';
 import { ShopifyService } from '../shopify/shopify.service';
 import type {
   CustomerOrder,
@@ -42,8 +41,7 @@ import type {
 } from '../shopify/shopify.types';
 import { createBraSizeReply } from './bra-size-calculator';
 
-const MAX_CONVERSATION_TURNS = 15;
-const MAX_CONVERSATION_MESSAGES = MAX_CONVERSATION_TURNS * 2;
+const MAX_CONVERSATION_MESSAGES = 5;
 /**
  * Enough for the lookups that genuinely chain — search by the sender's number,
  * then by the order number they quoted — while still bounding a model that
@@ -246,8 +244,6 @@ export class WhatsappService {
     @Optional()
     private readonly agentConfigService?: AgentConfigService,
     @Optional()
-    private readonly knowledgebaseService?: KnowledgebaseService,
-    @Optional()
     private readonly shopifyService?: ShopifyService,
   ) {}
 
@@ -367,13 +363,12 @@ export class WhatsappService {
     const chatModel = this.getChatModel(model);
     const userId = message.from ?? '';
     const history = await this.getConversationHistory(userId);
-    const knowledgebaseContext = await this.buildKnowledgebaseContext(text);
     const shopifyPrompt = `${
       this.canLookUpOrders(userId) ? ORDER_LOOKUP_SYSTEM_PROMPT : ''
     }${this.canSearchProducts() ? PRODUCT_SEARCH_SYSTEM_PROMPT : ''}`;
     const messages: BaseMessage[] = [
       new SystemMessage(
-        `${systemPrompt}${knowledgebaseContext}${shopifyPrompt}\n\nAct as an advisor to the human team as well as the customer-facing assistant. Flag the conversation for human attention only when a person genuinely needs to review or take over.`,
+        `${systemPrompt}${shopifyPrompt}\n\nAct as an advisor to the human team as well as the customer-facing assistant. Flag the conversation for human attention only when a person genuinely needs to review or take over.`,
       ),
       ...history,
       new HumanMessage(text),
@@ -813,30 +808,6 @@ export class WhatsappService {
         this.configService.get<string>('OPENAI_MODEL')?.trim() ||
         DEFAULT_MODEL,
     };
-  }
-
-  private async buildKnowledgebaseContext(userText: string): Promise<string> {
-    if (!this.knowledgebaseService) {
-      return '';
-    }
-
-    try {
-      const context =
-        await this.knowledgebaseService.buildContextForQuestion(userText);
-
-      if (!context) {
-        return '';
-      }
-
-      return `\n\nUse the following knowledge base excerpts to answer questions when relevant:\n\n${context}`;
-    } catch (error) {
-      this.logger.warn(
-        'Failed to load knowledgebase; replying without it',
-        error instanceof Error ? error.stack : String(error),
-      );
-
-      return '';
-    }
   }
 
   private async sendWhatsAppText(
