@@ -383,7 +383,7 @@ export class WhatsappService {
     const text = await this.extractUserText(message);
 
     if (!text) {
-      return 'Please send a text or voice message. I can respond to both now.';
+      return 'Por favor, envíeme un mensaje de texto o de voz. Puedo responder a ambos.';
     }
 
     const braSizeReply = createBraSizeReply(text);
@@ -431,7 +431,7 @@ export class WhatsappService {
     );
     const reply = advisorReply.reply.trim();
     const finalReply =
-      reply || 'Sorry, I could not generate a reply. Please try again.';
+      reply || 'Lo siento, no he podido generar una respuesta. Por favor, inténtelo de nuevo.';
     const needsHumanAttention =
       advisorReply.needsHumanAttention || reply.length === 0;
     const attentionReason = needsHumanAttention
