@@ -769,6 +769,65 @@ describe('WhatsappService', () => {
     expect(systemPrompt).toContain('only in Spanish');
   });
 
+  it('sends the dynamic stored system prompt to the model, overriding the default', async () => {
+    const storedSystemPrompt =
+      'BASE DE CONOCIMIENTO / INSTRUCCIONES PARA AGENTE IA\n' +
+      'Corsetería Singuerlin - Asesora de ventas por WhatsApp. Actúas como una ' +
+      'asesora experta. No eres un chatbot genérico.';
+    const agentConfigService = {
+      getConfig: jest.fn().mockResolvedValue({
+        systemPrompt: storedSystemPrompt,
+        model: null,
+        updatedAt: null,
+      }),
+    };
+    const service = new WhatsappService(
+      configService,
+      undefined,
+      agentConfigService as never,
+    );
+    const invoke = jest.fn().mockResolvedValue({
+      reply: 'Claro, con gusto le ayudo con su talla.',
+      needsHumanAttention: false,
+      attentionReason: '',
+    });
+    const serviceInternals = service as unknown as {
+      createReply: (message: {
+        from?: string;
+        id?: string;
+        type?: string;
+        text?: { body?: string };
+      }) => Promise<string>;
+      getChatModel: () => unknown;
+      saveConversationTurn: () => Promise<void>;
+    };
+    jest.spyOn(serviceInternals, 'getChatModel').mockReturnValue({
+      withStructuredOutput: () => ({ invoke }),
+    });
+    jest
+      .spyOn(serviceInternals, 'saveConversationTurn')
+      .mockResolvedValue(undefined);
+
+    await serviceInternals.createReply({
+      from: '34620753768',
+      id: 'wamid.dynamic-prompt',
+      type: 'text',
+      text: { body: 'Hola, necesito ayuda con una talla' },
+    });
+
+    expect(agentConfigService.getConfig).toHaveBeenCalled();
+
+    const systemPrompt = String(invoke.mock.calls[0][0][0].content);
+
+    // The stored (dynamic) prompt is what the model actually receives...
+    expect(systemPrompt).toContain('Corsetería Singuerlin');
+    expect(systemPrompt).toContain('asesora experta');
+    // ...instead of the built-in English default...
+    expect(systemPrompt).not.toContain('You are a helpful WhatsApp assistant');
+    // ...and the non-negotiable Spanish rule is still appended after it.
+    expect(systemPrompt).toContain('Always reply in Spanish');
+  });
+
   it('stores the advisor signal when a conversation needs human attention', async () => {
     const service = new WhatsappService(configService);
     const invoke = jest.fn().mockResolvedValue({
