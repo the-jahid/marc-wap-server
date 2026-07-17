@@ -190,6 +190,10 @@ const PRODUCT_SEARCH_TOOL = {
       'Always call it for colour, colourway, style, or model questions too, and include both ' +
       'the model name and garment type in the query (for example "Havanna bra"). Keep the ' +
       'query to those product-identifying words; omit conversational phrases such as "other colors". ' +
+      'Never put a size, band number, cup letter or measurement in the query: search "sujetador ' +
+      'sin aros", never "sujetador sin aros 120F". Sizes are not part of the product text, so a ' +
+      'size in the query matches nothing. Sizes come back in the "sizes offered" line of each ' +
+      'result; read that to answer any size question. ' +
       'Results are keyword matches, not exact answers: read the titles and descriptions ' +
       'and only tell the customer about products that genuinely match what they asked for.',
     parameters: {
@@ -224,7 +228,23 @@ const PRODUCT_SEARCH_SYSTEM_PROMPT =
   'not just the first product. Answer the colour question directly; do not ask for a size or ' +
   'push the customer toward a purchase unless they also asked about sizing or ordering. Do not ' +
   'mention related garments (such as panties) unless the customer asked about them. If the tool ' +
-  'finds nothing that matches, say so plainly.';
+  'finds nothing that matches, say so plainly. A search that returns nothing means those words ' +
+  'matched no product; it never means a size is unavailable. Only the "sizes offered" line can ' +
+  'tell you whether a size can be ordered, and your answer about a size must not change between ' +
+  'messages unless the tool told you something new.';
+
+/**
+ * The reply is written in a second pass that has no tools bound, and nothing
+ * runs after it is sent. A model that answers "let me check" has therefore
+ * already spent its only chance to look: the promise reaches the customer and
+ * is never kept. Tools have to be called in the same turn the customer asks.
+ */
+const TOOL_IMMEDIACY_SYSTEM_PROMPT =
+  '\n\nThere is no background work and no later follow-up: this reply is all the ' +
+  'customer gets. Never say you will check, look up, review, or come back with ' +
+  'options. Call the tool now and answer with what it returns. Only ask the ' +
+  'customer a question when you genuinely cannot search without the answer, and ' +
+  'never ask twice for a detail they have already given.';
 
 @Injectable()
 export class WhatsappService {
@@ -363,9 +383,12 @@ export class WhatsappService {
     const chatModel = this.getChatModel(model);
     const userId = message.from ?? '';
     const history = await this.getConversationHistory(userId);
+    const hasTools = this.canLookUpOrders(userId) || this.canSearchProducts();
     const shopifyPrompt = `${
       this.canLookUpOrders(userId) ? ORDER_LOOKUP_SYSTEM_PROMPT : ''
-    }${this.canSearchProducts() ? PRODUCT_SEARCH_SYSTEM_PROMPT : ''}`;
+    }${this.canSearchProducts() ? PRODUCT_SEARCH_SYSTEM_PROMPT : ''}${
+      hasTools ? TOOL_IMMEDIACY_SYSTEM_PROMPT : ''
+    }`;
     const messages: BaseMessage[] = [
       new SystemMessage(
         `${systemPrompt}${shopifyPrompt}\n\nAct as an advisor to the human team as well as the customer-facing assistant. Flag the conversation for human attention only when a person genuinely needs to review or take over.`,
@@ -544,9 +567,12 @@ export class WhatsappService {
   private describeProducts(result: ProductSearchResult): string {
     if (result.matches.length === 0) {
       return (
-        'NO_PRODUCTS_FOUND. The catalogue search returned nothing for that query. ' +
-        'Do not invent a product. Tell the customer you could not find it, and offer ' +
-        'to pass them to a colleague.'
+        'NO_PRODUCTS_FOUND. No product matched those search words. This says nothing ' +
+        'about sizes: sizes are never searched, so never tell the customer a size is ' +
+        'unavailable because of this result. If the query contained a size, a cup ' +
+        'letter or a measurement, search again with the product words alone and read ' +
+        'the "sizes offered" line. Otherwise do not invent a product: tell the ' +
+        'customer you could not find it, and offer to pass them to a colleague.'
       );
     }
 

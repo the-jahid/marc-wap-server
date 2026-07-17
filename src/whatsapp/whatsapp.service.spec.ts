@@ -594,6 +594,114 @@ describe('WhatsappService', () => {
     );
   });
 
+  it('does not let an empty catalogue search stand for an unavailable size', () => {
+    const service = new WhatsappService(configService);
+    const describeProducts = (
+      service as unknown as {
+        describeProducts: (result: {
+          model: string;
+          colors: string[];
+          matches: unknown[];
+        }) => string;
+      }
+    ).describeProducts.bind(service);
+
+    const described = describeProducts({
+      model: 'sujetador',
+      colors: [],
+      matches: [],
+    });
+
+    // Sizes are never searched, so "no match" is a statement about the query
+    // words alone. Reporting it as a sold-out size is what told a customer no
+    // 120F bra existed while the catalogue offered one.
+    expect(described).toContain('never tell the customer a size is');
+    expect(described).toContain('search again with the product words alone');
+  });
+
+  it('tells the model to search now rather than promise to check later', async () => {
+    const shopify = {
+      isConfigured: () => false,
+      canSearchProducts: () => true,
+    } as unknown as ShopifyService;
+    const service = new WhatsappService(
+      configService,
+      undefined,
+      undefined,
+      shopify,
+    );
+    const invoke = jest.fn().mockResolvedValue({
+      reply: 'The 120F is available with underwire in black and white.',
+      needsHumanAttention: false,
+      attentionReason: '',
+    });
+    const serviceInternals = service as unknown as {
+      createReply: (message: {
+        from?: string;
+        id?: string;
+        type?: string;
+        text?: { body?: string };
+      }) => Promise<string>;
+      getChatModel: () => unknown;
+      saveConversationTurn: () => Promise<void>;
+    };
+    jest.spyOn(serviceInternals, 'getChatModel').mockReturnValue({
+      bindTools: () => ({ invoke: jest.fn().mockResolvedValue({}) }),
+      withStructuredOutput: () => ({ invoke }),
+    });
+    jest
+      .spyOn(serviceInternals, 'saveConversationTurn')
+      .mockResolvedValue(undefined);
+
+    await serviceInternals.createReply({
+      from: '15551234567',
+      id: 'wamid.immediacy',
+      type: 'text',
+      text: { body: 'I want a bra in size 120F' },
+    });
+
+    const systemPrompt = String(invoke.mock.calls[0][0][0].content);
+
+    expect(systemPrompt).toContain('Never say you will check');
+    expect(systemPrompt).toContain('Call the tool now');
+  });
+
+  it('leaves the search-now rule out when no tools are available', async () => {
+    const service = new WhatsappService(configService);
+    const invoke = jest.fn().mockResolvedValue({
+      reply: 'Sure, how can I help?',
+      needsHumanAttention: false,
+      attentionReason: '',
+    });
+    const serviceInternals = service as unknown as {
+      createReply: (message: {
+        from?: string;
+        id?: string;
+        type?: string;
+        text?: { body?: string };
+      }) => Promise<string>;
+      getChatModel: () => unknown;
+      saveConversationTurn: () => Promise<void>;
+    };
+    jest.spyOn(serviceInternals, 'getChatModel').mockReturnValue({
+      withStructuredOutput: () => ({ invoke }),
+    });
+    jest
+      .spyOn(serviceInternals, 'saveConversationTurn')
+      .mockResolvedValue(undefined);
+
+    await serviceInternals.createReply({
+      from: '15551234567',
+      id: 'wamid.no-tools',
+      type: 'text',
+      text: { body: 'Hello' },
+    });
+
+    expect(String(invoke.mock.calls[0][0][0].content)).not.toContain(
+      'Never say you will check',
+    );
+  });
+
   it('stores the advisor signal when a conversation needs human attention', async () => {
     const service = new WhatsappService(configService);
     const invoke = jest.fn().mockResolvedValue({
